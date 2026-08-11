@@ -1,0 +1,51 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+
+# Production deployment - exclude uploads and temp files
+uploads/**/*
+!uploads/.gitkeep
+temp/**/*
+!temp/.gitkeep
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Large development files - exclude for production
+attached_assets/Antrid-*.jpg
+attached_assets/image_*.png
+attached_assets/*.pdf
+
+# Keep essential production assets
+!attached_assets/logo.svg
+!attached_assets/a-photograph-of-a-stylized-logo-for-race_6KCjcglJTz-0j8p9B-pYJQ_Qs02YVLXSO-J94EuMmuVqA*
+
+# OCR training data - downloads automatically
+eng.traineddata
+
+# Large files to avoid in deployment
+*.zip
+*.rar
+*.7z
+*.tar
+
+# Log files
+*.log
+logs/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Security: Never commit credential files
+google-credentials.json
+google_credentials_json
+*service-account*.json
+*credentials*.json

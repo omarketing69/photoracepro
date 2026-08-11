@@ -1,0 +1,2 @@
+- [Facial recognition system](facial-recognition.md) — selfie detection works; stored photos need landmarkVector for search to return results.
+- [Dorsal number filtering](dorsal-filter.md) — valid range is 1–1600 for all events on this platform; cleaned 3160 photos of invalid dorsals.

@@ -1,0 +1,57 @@
+Consideraciones de Tamaño para Carga y Descarga
+en Google Cloud Storage
+Google Cloud Storage está diseñado para manejar archivos de gran tamaño, por lo que
+no tendrás problemas con las fotos de tu carrera. Sin embargo, hay algunas
+consideraciones importantes para optimizar la carga, descarga y costos.
+Límites de Tamaño de Archivo
+Tamaño máximo por archivo: Google Cloud Storage admite archivos de hasta 5
+terabytes (TB), por lo que el tamaño de tus fotos no será un problema.
+Estrategia de Carga y Descarga
+Para optimizar la experiencia del usuario y los costos, te recomiendo implementar una
+estrategia de múltiples tamaños de imagen:
+1. Original (Alta Resolución):
+Propósito: Para la impresión y como copia de seguridad de máxima
+calidad.
+Tamaño: 2550 x 3300 píxeles (o la resolución original de la cámara si es
+mayor).
+Formato: JPEG (alta calidad).
+Almacenamiento: Guarda estas imágenes en una clase de almacenamiento
+de bajo costo como Nearline o Coldline si no se accederá a ellas con
+frecuencia.
+2. Versión Web (Mediana Resolución):
+Propósito: Para mostrar en la galería de tu plataforma web. Esto permitirá
+que la página se cargue rápidamente.
+Tamaño: Aproximadamente 1200 x 1600 píxeles.
+Formato: JPEG (calidad media).
+Tamaño del archivo: Entre 200 KB y 500 KB.
+Almacenamiento: Guarda estas imágenes en la clase de almacenamiento
+Standard para un acceso rápido.
+3. Miniatura (Baja Resolución):
+Propósito: Para mostrar vistas previas en la galería antes de que el usuario
+haga clic en una imagen.
+Tamaño: Aproximadamente 300 x 400 píxeles.
+Formato: JPEG (calidad media).
+Tamaño del archivo: Entre 20 KB y 50 KB.
+Almacenamiento: Guarda estas imágenes en la clase de almacenamiento
+Standard.
+Flujo de Trabajo Recomendado
+1. Carga: El fotógrafo sube las fotos originales en alta resolución a un bucket de
+Google Cloud Storage.
+2. Procesamiento: Utiliza Cloud Functions o un servicio similar para generar
+automáticamente las versiones web y las miniaturas de cada foto que se sube.
+3. Visualización: Tu plataforma web muestra las miniaturas y las versiones web a
+los usuarios.
+4. Descarga: Cuando un participante compra una foto, le proporcionas un enlace
+de descarga seguro a la versión original en alta resolución.
+Consideraciones de Costos
+Almacenamiento: El costo de almacenamiento varía según la clase de
+almacenamiento que elijas. La clase Standard es la más cara, mientras que
+Nearline y Coldline son más económicas.
+Transferencia de Datos: Google Cloud cobra por la transferencia de datos
+(salida) cuando los usuarios descargan las fotos. Los precios varían según la
+región.
+Operaciones: También hay costos asociados con las operaciones de carga y
+descarga (solicitudes GET y PUT).
+Al implementar una estrategia de múltiples tamaños, puedes reducir
+significativamente los costos de almacenamiento y transferencia de datos, al tiempo
+que ofreces una experiencia de usuario rápida y fluida.
