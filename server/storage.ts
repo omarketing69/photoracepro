@@ -1140,25 +1140,36 @@ export class DatabaseStorage implements IStorage {
 
   async useDownloadCode(code: string): Promise<{ success: boolean; downloadCode?: DownloadCode; error?: string; }> {
     console.log(`🔑 [STORAGE] Using download code: ${code}`);
-    
+
     try {
-      const validation = await this.validateDownloadCode(code);
-      
-      if (!validation.valid || !validation.downloadCode) {
-        return { success: false, error: validation.error };
-      }
-      
-      // Update the download code usage
+      // UPDATE atómico condicional: sólo incrementa si no se ha superado el límite.
+      // Esto evita race conditions entre requests concurrentes.
       const [updated] = await db
         .update(downloadCodes)
         .set({
-          downloadCount: (validation.downloadCode.downloadCount ?? 0) + 1,
+          downloadCount: sql`${downloadCodes.downloadCount} + 1`,
           isUsed: true,
           usedAt: new Date(),
         })
-        .where(eq(downloadCodes.code, code))
+        .where(
+          and(
+            eq(downloadCodes.code, code),
+            sql`COALESCE(${downloadCodes.downloadCount}, 0) < COALESCE(${downloadCodes.maxDownloads}, 3)`,
+            sql`(${downloadCodes.expiresAt} IS NULL OR ${downloadCodes.expiresAt} > NOW())`
+          )
+        )
         .returning();
-      
+
+      if (!updated) {
+        // Re-validar para entregar un mensaje claro (expirado vs límite).
+        const existing = await this.getDownloadCode(code);
+        if (!existing) return { success: false, error: "Download code not found" };
+        if (existing.expiresAt && existing.expiresAt < new Date()) {
+          return { success: false, error: "Download code has expired" };
+        }
+        return { success: false, error: "Download code has been used to maximum limit" };
+      }
+
       console.log(`✅ [STORAGE] Download code used successfully: ${code} (usage: ${updated.downloadCount}/${updated.maxDownloads})`);
       return { success: true, downloadCode: updated };
     } catch (error) {

@@ -2,26 +2,24 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from "@shared/schema";
 
-// CONFIGURACIÓN CRÍTICA: Usar la base de datos que contiene las 898 fotos del Evento 8
+// CONFIGURACIÓN CRÍTICA: la URL de la DB DEBE venir de variables de entorno.
+// Nunca hardcodear credenciales en el código (se confirmará al repo público).
 const createCorrectDatabaseUrl = () => {
-  // PRIORIDAD 1: DATABASE_URL (donde están las 898 fotos del Evento 8)
-  if (process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('postgresql://')) {
-    console.log('✅ USANDO BASE DE DATOS CON FOTOS: DATABASE_URL (ep-wint...)');
-    return process.env.DATABASE_URL;
+  const url = process.env.DATABASE_URL;
+  if (!url || !url.startsWith('postgresql://')) {
+    throw new Error(
+      'DATABASE_URL env var is required (must start with postgresql://). ' +
+      'Do not hardcode credentials in source. Set it in .env.local or your host secrets.'
+    );
   }
-  
-  // Respaldo solo si DATABASE_URL no existe
-  console.error('❌ DATABASE_URL no encontrado - usando respaldo pero puede no tener las fotos');
-  const respaldoBaseDatos = "postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require";
-  return respaldoBaseDatos;
+  return url;
 };
 
 const connectionString = createCorrectDatabaseUrl();
-console.log('🔍 BASE DE DATOS ACTIVA:', connectionString.includes('ep-wint') ? 'CORRECTA con fotos Evento 8 ✅' : '⚠️  Verificar que tenga las 898 fotos');
 
 export const connection = postgres(connectionString, {
   ssl: connectionString.includes('localhost') ? false : 'prefer',
-  max: 1,
+  max: Number(process.env.DB_POOL_MAX) || 10,
   idle_timeout: 20,
   connect_timeout: 10
 });

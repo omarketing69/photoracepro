@@ -1,17 +1,78 @@
 import express, { type Request, Response, NextFunction } from "express";
 import path from "path";
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 
 const app = express();
 
-// Configuración aumentada para 1000 fotos adicionales
-app.use(express.json({ 
-  limit: '5gb'
+// Lista de orígenes permitidos para CORS. En dev permitir el mismo host.
+const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Seguridad: helmet con CSP básica. Si usas uploads/servicios externos,
+// ajusta las directivas según sea necesario.
+app.use(helmet({
+  contentSecurityPolicy: process.env.NODE_ENV === "production" ? {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "blob:", "https:"],
+      connectSrc: ["'self'", "https:"],
+      fontSrc: ["'self'", "data:"],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+    },
+  } : false,
+  crossOriginEmbedderPolicy: false,
 }));
 
-app.use(express.urlencoded({ 
-  extended: false, 
+// CORS con allowlist; si no se define, deniega cross-origin.
+app.use(cors({
+  origin(origin: string | undefined, cb: (err: Error | null, ok?: boolean) => void) {
+    if (!origin || ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) {
+      return cb(null, true);
+    }
+    return cb(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  credentials: true,
+}));
+
+// Rate limit global (protege contra fuerza bruta/abuso básico).
+// 100 req / 15 min por IP. En rutas sensibles aplicamos uno más estricto.
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later.", code: "RATE_LIMITED" },
+});
+app.use("/api", globalLimiter);
+
+// Limit estricto para /api/admin/* y /api/auth/*
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many admin requests, please try again later.", code: "RATE_LIMITED" },
+});
+app.use("/api/admin", adminLimiter);
+app.use("/api/auth", adminLimiter);
+
+// Configuración aumentada pero razonable. Los uploads van por multipart,
+// no por JSON, así que el body JSON no necesita GBs.
+app.use(express.json({
+  limit: '1mb'
+}));
+
+app.use(express.urlencoded({
+  extended: false,
   limit: '5gb'
 }));
 
@@ -30,7 +91,7 @@ app.use((req, res, next) => {
 });
 
 // Manejo específico para errores 413 (Request Entity Too Large)
-app.use((err, req, res, next) => {
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   if (err.code === 'LIMIT_FILE_SIZE' || err.code === 'LIMIT_PART_COUNT' || err.code === 'LIMIT_FIELD_COUNT' || err.code === 'LIMIT_FIELD_VALUE' || err.code === 'LIMIT_UNEXPECTED_FILE') {
     console.error('❌ Error 413 - Multer:', {
       code: err.code,
@@ -203,8 +264,11 @@ app.use((req, res, next) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
 
+    // No relanzar: ya estamos respondiendo. Si los headers se enviaron, delegar al handler por defecto.
+    if (res.headersSent) {
+      return;
+    }
     res.status(status).json({ message });
-    throw err;
   });
 
   // Vite setup moved earlier to prevent API interference

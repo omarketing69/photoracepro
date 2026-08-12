@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
 import os
 import json
 import sqlite3
@@ -13,7 +14,15 @@ import threading
 import time
 
 app = Flask(__name__)
-CORS(app)
+
+# CORS allowlist (no open CORS en producción). Orígenes desde env CSV.
+_allowed_origins = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+CORS(app, origins=_allowed_origins or False, supports_credentials=True)
+
+# Límite de tamaño de upload (50 MB por request).
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+# Secret key desde env (no hardcodeado).
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", os.urandom(32))
 
 # Configuration
 UPLOAD_FOLDER = 'uploads'
@@ -387,12 +396,13 @@ def create_event():
         event_id = cursor.lastrowid
         conn.commit()
         
-        # Create cloud storage directory for event
-        event_dir = f"{CLOUD_STORAGE_FOLDER}/events/evento_{event_id}_{data['name'].replace(' ', '_')}"
-        os.makedirs(f"{event_dir}/originales", exist_ok=True)
-        os.makedirs(f"{event_dir}/web", exist_ok=True)
-        os.makedirs(f"{event_dir}/thumbnails", exist_ok=True)
-        os.makedirs(f"{event_dir}/participantes", exist_ok=True)
+# Create cloud storage directory for event (sanitize name)
+    safe_name = secure_filename(data['name']) or f"event_{event_id}"
+    event_dir = f"{CLOUD_STORAGE_FOLDER}/events/evento_{event_id}_{safe_name}"
+    os.makedirs(f"{event_dir}/originales", exist_ok=True)
+    os.makedirs(f"{event_dir}/web", exist_ok=True)
+    os.makedirs(f"{event_dir}/thumbnails", exist_ok=True)
+    os.makedirs(f"{event_dir}/participantes", exist_ok=True)
         
         # Return created event
         cursor.execute('SELECT * FROM events WHERE id = ?', (event_id,))
@@ -434,8 +444,10 @@ def upload_photos(event_id):
     try:
         for file in files:
             if file and file.filename:
-                # Save file
-                filename = file.filename
+                # Save file (secure_filename previene path traversal: ../../etc/passwd)
+                filename = secure_filename(file.filename)
+                if not filename:
+                    filename = f"upload_{int(time.time()*1000)}.jpg"
                 file_path = os.path.join(UPLOAD_FOLDER, filename)
                 file.save(file_path)
                 
@@ -554,4 +566,8 @@ def process_event_photos(event_id):
 
 if __name__ == '__main__':
     init_db()
-    app.run(host='0.0.0.0', port=8000, debug=True)
+    # Debug=True + 0.0.0.0 habilita el debugger de Werkzeug → RCE. Lo desactivamos.
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    host = os.environ.get("FLASK_HOST", "127.0.0.1")
+    port = int(os.environ.get("FLASK_PORT", "8000"))
+    app.run(host=host, port=port, debug=debug)

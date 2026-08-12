@@ -2,7 +2,8 @@ import postgres from 'postgres';
 import * as bcrypt from 'bcrypt';
 
 async function fixAdminLogin() {
-  const sql = postgres('postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require');
+  if (!process.env.DATABASE_URL) { throw new Error('DATABASE_URL env var required'); }
+  const sql = postgres(process.env.DATABASE_URL);
   
   try {
     console.log('🔍 Verificando usuario administrador...');

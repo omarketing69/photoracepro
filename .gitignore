@@ -49,3 +49,10 @@ google-credentials.json
 google_credentials_json
 *service-account*.json
 *credentials*.json
+
+# Environment / secrets - NEVER commit
+.env
+.env.*
+!.env.example
+.env.local
+*.env

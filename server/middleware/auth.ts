@@ -19,8 +19,14 @@ interface JWTPayload {
   exp: number;
 }
 
-// JWT Secret - debe estar en variables de entorno para producción
-const JWT_SECRET = process.env.JWT_SECRET || 'racephoto-ultra-secure-jwt-secret-key-2025';
+// JWT Secret - debe estar en variables de entorno. Nunca usar un fallback
+// hardcodeado (sería forjable por cualquier atacante que lea el repo).
+const DEFAULT_SECRET_WARNING = 'racephoto-ultra-secure-jwt-secret-key-2025';
+const isProd = process.env.NODE_ENV === 'production';
+if (isProd && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
+  throw new Error('JWT_SECRET environment variable is required and must be >= 32 chars in production.');
+}
+const JWT_SECRET = process.env.JWT_SECRET || (isProd ? '' : DEFAULT_SECRET_WARNING);
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
 const ADMIN_SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutos para admin
 

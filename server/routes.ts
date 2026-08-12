@@ -1,5 +1,6 @@
 import express, { type Express } from "express";
 import { createServer, type Server } from "http";
+import crypto from "crypto";
 import { storage } from "./storage";
 import { zipProcessor } from "./zip-processor";
 import { insertEventSchema, insertPhotoSchema, insertParticipantSchema, insertSaleSchema, insertPhotographerApplicationSchema, type Photo } from "@shared/schema";
@@ -95,24 +96,22 @@ const upload = multer({
     headerPairs: 10000, // Max 10000 pares de headers
   },
   fileFilter: (req, file, cb) => {
-    // 📱 CRITICAL FIX: Add HEIC/HEIF support for iPhone photos
-    const allowedTypes = /jpeg|jpg|png|tiff|gif|webp|bmp|heic|heif/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
+    // Regex anclada para mimetype (evita bypass tipo "image/jpeg-x-evil").
+    const allowedExt = /^\.(jpe?g|png|tiff|gif|webp|bmp|heic|heif)$/i;
+    const allowedMime = /^image\/(jpeg|png|tiff|gif|webp|bmp|heic|heif)$/i;
+    const extOk = allowedExt.test(path.extname(file.originalname).toLowerCase());
+    const mimeOk = allowedMime.test(file.mimetype);
 
     console.log(`🔍 [UPLOAD FILTER] File: ${file.originalname}`);
     console.log(`🔍 [UPLOAD FILTER] MIME: ${file.mimetype}`);
-    console.log(`🔍 [UPLOAD FILTER] Ext test: ${extname}, MIME test: ${mimetype}`);
 
-    // 📱 SPECIAL CASE: Accept HEIC/HEIF files by extension even if MIME is wrong
-    const isHeicByExtension = /\.(heic|heif)$/i.test(file.originalname);
-    if (isHeicByExtension) {
+    // 📱 SPECIAL CASE: HEIC/HEIF por extensión (algunos clients envían octet-stream).
+    if (/\.(heic|heif)$/i.test(file.originalname)) {
       console.log(`📱 [HEIC] Accepting iPhone photo by extension: ${file.originalname}`);
       return cb(null, true);
     }
-    
-    // Normal validation for other image types
-    if (mimetype && extname) {
+
+    if (extOk && mimeOk) {
       console.log(`✅ [UPLOAD FILTER] File accepted: ${file.originalname}`);
       return cb(null, true);
     } else {
@@ -179,8 +178,19 @@ async function processPhotoWithOCR(photoId: number, imagePath: string) {
 }
 
 function generateSimpleToken(): string {
-  // Generate a simple download token without Wompi dependency
-  return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  // Token criptográficamente seguro (no usar Math.random() para tokens).
+  return crypto.randomBytes(24).toString('hex');
+}
+
+// Firma HMAC de la referencia de pago para validar /payment/success.
+// Reemplaza la integración real con Wompi (webhook con firma) cuando esté disponible.
+function getPaymentSigSecret(): string {
+  const s = process.env.JWT_SECRET || process.env.PAYMENT_SIG_SECRET;
+  if (!s) throw new Error('JWT_SECRET or PAYMENT_SIG_SECRET must be set to sign payment callbacks');
+  return s;
+}
+function signPaymentReference(reference: string): string {
+  return crypto.createHmac('sha256', getPaymentSigSecret()).update(reference).digest('hex');
 }
 
 export async function registerRoutes(app: Express): Promise<Server> {
@@ -1151,8 +1161,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Download all photos from an event (Athletes and Admins only)
-  app.get("/api/events/:id/download/all", requireRoles(['athlete', 'admin']), async (req, res) => {
+  // Download all photos from an event: restringido a admin.
+// Los atletas NO deben poder descargar TODO el evento (filtrado por dorsal se hace
+// vía /api/search + download codes). Si en el futuro se quieren descargas bulk por
+// atleta, hace falta vincular participants.userId y filtrar por dorsal del JWT.
+  app.get("/api/events/:id/download/all", requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       
@@ -2207,7 +2220,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // 🚨 EMERGENCY ENDPOINT FOR MOBILE PHOTOGRAPHERS - NO AUTH REQUIRED
-  app.post("/api/emergency/mobile-upload", (req, res, next) => {
+  app.post("/api/emergency/mobile-upload", requireUser, (req, res, next) => {
     console.log(`🚨 === EMERGENCY MOBILE UPLOAD REQUEST ===`);
     console.log(`   📱 Method: ${req.method}`);
     console.log(`   📱 URL: ${req.url}`);
@@ -2216,8 +2229,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     console.log(`   📱 User-Agent: ${req.headers['user-agent']}`);
     console.log(`   📱 Origin: ${req.headers.origin}`);
     console.log(`   📱 Host: ${req.headers.host}`);
-    console.log(`   📱 Connection: ${req.headers.connection}`);
-    console.log(`   📱 EMERGENCY MODE: Authentication bypassed for 10 photographers`);
     
     console.log(`📥 === PASANDO A MULTER (EMERGENCY) ===`);
     next();
@@ -2296,7 +2307,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Individual photos upload endpoint - SECURE FOR PHOTOGRAPHERS
-  app.post("/api/photos/upload", requireUser, (req, res, next) => {
+  app.post("/api/photos/upload", requireRoles(['admin', 'photographer']), (req, res, next) => {
     console.log(`📥 === INICIO DE REQUEST DE UPLOAD ===`);
     console.log(`   - Method: ${req.method}`);
     console.log(`   - URL: ${req.url}`);
@@ -2478,7 +2489,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post("/api/photos/upload-zip", requireUser, zipUpload.single('zipFile'), async (req, res) => {
+  app.post("/api/photos/upload-zip", requireRoles(['admin', 'photographer']), zipUpload.single('zipFile'), async (req, res) => {
     try {
       const { eventId } = req.body;
       const zipFile = req.file;
@@ -3560,7 +3571,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // REMOVED DUPLICATE ENDPOINT - using the main one above
 
   // Sync photos from Google Cloud Storage
-  app.post('/api/admin/sync-cloud-photos', async (req, res) => {
+  app.post('/api/admin/sync-cloud-photos', requireAdmin, async (req, res) => {
     try {
       const { syncCloudPhotos } = await import('./sync-cloud-photos');
       await syncCloudPhotos();
@@ -3572,7 +3583,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Fix event organization
-  app.post('/api/admin/fix-event-organization', async (req, res) => {
+  app.post('/api/admin/fix-event-organization', requireAdmin, async (req, res) => {
     try {
       const { fixEventOrganization } = await import('./fix-event-organization');
       const result = await fixEventOrganization();
@@ -3584,7 +3595,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Fix thumbnail paths - DISABLED to prevent Google Cloud Storage path overwrites
-  app.post('/api/admin/fix-thumbnails', async (req, res) => {
+  app.post('/api/admin/fix-thumbnails', requireAdmin, async (req, res) => {
     res.json({ 
       success: false, 
       message: 'Thumbnail fix disabled to prevent Google Cloud Storage path overwrites',
@@ -3620,7 +3631,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Cleanup temporary files endpoint
-  app.post('/api/admin/cleanup-temp', async (req, res) => {
+  app.post('/api/admin/cleanup-temp', requireAdmin, async (req, res) => {
     try {
       const fs = await import('fs');
       const path = await import('path');
@@ -3662,7 +3673,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Diagnostic endpoint for upload issues
-  app.get('/api/admin/diagnose-upload', async (req, res) => {
+  app.get('/api/admin/diagnose-upload', requireAdmin, async (req, res) => {
     try {
       const { diagnoseUploadSystem, diagnoseHangingUploads } = await import('./diagnose-upload');
       
@@ -4121,24 +4132,41 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { code, filename } = req.params;
       
       console.log(`🔑 Download request with code: ${code} for file: ${filename}`);
-      
-      // Use the download code
-      const usage = await storage.useDownloadCode(code);
-      
-      if (!usage.success || !usage.downloadCode) {
+
+      // 1) Validar (sin consumir) el código y obtener el dorsal autorizado.
+      const validation = await storage.validateDownloadCode(code);
+      if (!validation.valid || !validation.downloadCode) {
         return res.status(400).json({
           success: false,
-          error: usage.error || 'No se pudo usar el código de descarga'
+          error: validation.error || 'No se pudo usar el código de descarga'
         });
       }
-      
-      // Get the photo by filename for the specific event
-      const photo = await storage.getPhotoByFilenameForEvent(usage.downloadCode.eventId, filename);
-      
+      const authorizedDorsal = validation.downloadCode.dorsalNumber;
+      const authorizedEventId = validation.downloadCode.eventId;
+
+      // 2) Recuperar la foto solicitada y verificar que pertenezca al dorsal del código.
+      //    Esto previene que alguien descargue fotos ajenas gastando el código.
+      const photo = await storage.getPhotoByFilenameForEvent(authorizedEventId, filename);
       if (!photo) {
         return res.status(404).json({
           success: false,
           error: 'Foto no encontrada'
+        });
+      }
+      const photoDorsals: number[] = Array.isArray(photo.detectedDorsals) ? (photo.detectedDorsals as number[]) : [];
+      if (!photoDorsals.includes(authorizedDorsal)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Este código no autoriza la descarga de esa foto'
+        });
+      }
+
+      // 3) Ahora sí consumir el uso (atómico en storage.useDownloadCode).
+      const usage = await storage.useDownloadCode(code);
+      if (!usage.success || !usage.downloadCode) {
+        return res.status(400).json({
+          success: false,
+          error: usage.error || 'No se pudo usar el código de descarga'
         });
       }
       
@@ -4185,14 +4213,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       // Stream the file
       const stream = fs.createReadStream(photoPath);
+      stream.on('error', (err) => {
+        console.error('Stream error downloading photo with code:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ success: false, error: 'Error leyendo el archivo' });
+        } else {
+          try { res.end(); } catch {}
+        }
+      });
       stream.pipe(res);
       
     } catch (error) {
       console.error('Error downloading photo with code:', error);
-      res.status(500).json({
-        success: false,
-        error: 'Error interno del servidor al descargar la foto'
-      });
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          error: 'Error interno del servidor al descargar la foto'
+        });
+      }
     }
   });
 
@@ -4579,7 +4617,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post('/api/events/:eventId/pricing', async (req, res) => {
+  app.post('/api/events/:eventId/pricing', requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.eventId);
       const { eventPricing, insertEventPricingSchema } = await import('@shared/schema');
@@ -4681,18 +4719,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Sales and Payment endpoints
-  app.post('/api/sales/create', async (req, res) => {
+  app.post('/api/sales/create', requireUser, async (req, res) => {
     try {
-      const { customerEmail, customerName, photoIds, amount } = req.body;
-      
-      if (!customerEmail || !photoIds || !amount) {
-        return res.status(400).json({ error: 'Faltan datos requeridos' });
+      const { customerEmail, customerName, photoIds, amount, eventId, dorsalNumber } = req.body;
+
+      if (!customerEmail || !photoIds || !amount || !eventId) {
+        return res.status(400).json({ error: 'Faltan datos requeridos (customerEmail, photoIds, amount, eventId)' });
       }
 
-      // Create sale record (simplified, no external payment gateway)
+      // Crear registro de venta. eventId y dorsalNumber vienen del body (no hardcodear).
       const saleData = {
-        eventId: 1, // Media Maratón del Oriente 2024
-        dorsalNumber: null,
+        eventId: Number(eventId),
+        dorsalNumber: dorsalNumber != null ? Number(dorsalNumber) : null,
         photoIds,
         amount: amount.toString(),
         customerEmail,
@@ -4705,10 +4743,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const sale = await storage.createSale(saleData);
 
+      // URL firmada para que el flujo cliente pueda invocar /payment/success.
+      // Sin firma válida, nadie puede auto-aprobar una venta.
+      const reference = sale.wompiReference || sale.downloadToken || String(sale.id);
+      const sig = signPaymentReference(reference);
+      const paymentVerifyUrl = `/payment/success?reference=${encodeURIComponent(reference)}&sig=${sig}`;
+
       res.json({
         success: true,
         saleId: sale.id,
-        message: 'Sale created successfully - use code-based payment system'
+        paymentVerifyUrl,
+        message: 'Sale created successfully - redirect user to paymentVerifyUrl to confirm payment'
       });
 
     } catch (error) {
@@ -4719,29 +4764,46 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
 
 
-  // Payment success callback (simplified without Wompi)
+  // Payment success callback (simplified without Wompi).
+  // ⚠️ REEMPLAZAR por webhook firmado de Wompi en producción real. Mientras tanto,
+  // exigimos firma HMAC (sig) generada por el servidor para evitar aprobaciones
+  // arbitrarias por cualquiera que conozca la referencia.
   app.get('/payment/success', async (req, res) => {
     try {
       console.log('=== PAYMENT SUCCESS CALLBACK ===');
       console.log('Query params:', req.query);
-      
-      const { reference } = req.query;
-      
+
+      const { reference, sig } = req.query;
+
       if (!reference) {
         console.log('No reference found in callback');
         return res.redirect('/search?error=invalid_reference');
       }
 
+      // Validar firma HMAC. Sin firma válida, no aprobamos.
+      try {
+        const expectedSig = signPaymentReference(reference as string);
+        const sigStr = String(sig || '');
+        const sigBuf = Buffer.from(sigStr);
+        const expBuf = Buffer.from(expectedSig);
+        if (sigStr.length !== expectedSig.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+          console.warn(`⚠️ [SECURITY] Invalid payment signature for reference=${reference}`);
+          return res.redirect('/search?error=invalid_signature');
+        }
+      } catch (err) {
+        console.error('Cannot verify payment signature (missing secret):', err);
+        return res.redirect('/search?error=signature_error');
+      }
+
       console.log('Processing payment verification for reference:', reference);
-      
+
       // Find the sale first
       const sale = await storage.getSaleByReference(reference as string);
       console.log('Found sale:', sale);
-      
+
       if (sale) {
-        // Simplified approval without external payment gateway
-        console.log('Approving payment automatically (code-based system)');
-        
+        console.log('Approving payment (signature verified, code-based system)');
+
         await storage.updateSale(sale.id, {
           status: 'approved',
           paidAt: new Date()
@@ -4816,7 +4878,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // 🔥 ÚNICO ENDPOINT DE DESCARGA - Para fotos compradas y gratuitas
-  app.get('/api/photos/:photoId/download', async (req, res) => {
+  app.get('/api/photos/:photoId/download', requireUser, async (req, res) => {
     console.log(`🔥 DOWNLOAD_GCS_HANDLER: Processing photo ${req.params.photoId}`);
     try {
       const photoId = parseInt(req.params.photoId);
@@ -4842,7 +4904,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const fetch = (await import('node-fetch')).default;
         const response = await fetch(signedUrl);
         
-        if (!response.ok) {
+        if (!response.ok || !response.body) {
           throw new Error(`Failed to fetch image: ${response.status}`);
         }
         
@@ -4851,20 +4913,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
         res.setHeader('Content-Type', 'image/jpeg');
         res.setHeader('Content-Length', response.headers.get('content-length') || '');
         
-        // Pipe the response body to the client
-        if (response.body) {
-          response.body.pipe(res);
-        } else {
-          throw new Error('Response body is null');
-        }
+        // Pipe the response body to the client, con manejo de errores del stream.
+        response.body.on('error', (err: any) => {
+          console.error(`Stream error downloading photo ${photoId}:`, err);
+          if (!res.headersSent) {
+            res.status(500).json({ error: 'Error en la descarga' });
+          } else {
+            try { res.end(); } catch {}
+          }
+        });
+        res.on('close', () => {
+          try { (response.body as any)?.destroy(); } catch {}
+        });
+        response.body.pipe(res);
         return;
       } catch (cloudError) {
         console.error(`Error generating signed URL for photo ${photoId}:`, cloudError);
-        return res.status(500).json({ error: 'Error generando URL de descarga' });
+        if (!res.headersSent) {
+          return res.status(500).json({ error: 'Error generando URL de descarga' });
+        }
       }
     } catch (error) {
       console.error('Error en descarga de foto:', error);
-      res.status(500).json({ error: 'Error procesando descarga' });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error procesando descarga' });
+      }
     }
   });
 
@@ -4895,7 +4968,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post('/api/settings', async (req, res) => {
+  app.post('/api/settings', requireAdmin, async (req, res) => {
     try {
       const { systemSettings } = await import('@shared/schema');
       const { db } = await import('./db');
@@ -4933,7 +5006,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Free photos management
-  app.post('/api/events/:id/enable-free-photos', async (req, res) => {
+  app.post('/api/events/:id/enable-free-photos', requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       const { events } = await import('@shared/schema');
@@ -4967,7 +5040,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post('/api/events/:id/disable-free-photos', async (req, res) => {
+  app.post('/api/events/:id/disable-free-photos', requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       const { events } = await import('@shared/schema');
@@ -6339,7 +6412,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // System cleanup endpoint
-  app.post('/api/admin/clean-system', async (req, res) => {
+  app.post('/api/admin/clean-system', requireAdmin, async (req, res) => {
     try {
       console.log('🧹 Starting complete system cleanup...');
       
@@ -6800,7 +6873,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Delete user (admin only)
-  app.delete('/api/users/:id', async (req, res) => {
+  app.delete('/api/users/:id', requireAdmin, async (req, res) => {
     try {
       const userId = parseInt(req.params.id);
       const { users, photographerEventAssignments } = await import('@shared/schema');
@@ -6826,8 +6899,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Admin endpoints
   
-  // Change admin password
-  app.post('/api/admin/change-password', async (req, res) => {
+  // Change admin password (protegido con requireAdmin; usa bcrypt)
+  app.post('/api/admin/change-password', requireAdmin, async (req, res) => {
     try {
       const { currentPassword, newPassword } = req.body;
       
@@ -6835,29 +6908,35 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Current password and new password are required' });
       }
       
-      if (newPassword.length < 6) {
-        return res.status(400).json({ error: 'New password must be at least 6 characters long' });
+      if (newPassword.length < 8) {
+        return res.status(400).json({ error: 'New password must be at least 8 characters long' });
       }
       
       const { users } = await import('@shared/schema');
       const { db } = await import('./db');
       const { eq } = await import('drizzle-orm');
       
-      // For now, we'll assume the admin user has ID 1 (demo user)
-      // In a production system, you'd get the user ID from authentication
+      // Tomar el id del JWT (no asumir id=1). El middleware requireAdmin ya lo cargó.
+      const adminUser = (req as any).authenticatedUser;
       const [admin] = await db
         .select()
         .from(users)
-        .where(eq(users.id, 1));
+        .where(eq(users.id, adminUser.id));
       
-      if (!admin || admin.password !== currentPassword) {
+      if (!admin || !admin.password) {
+        return res.status(401).json({ error: 'Current password is incorrect' });
+      }
+
+      const ok = await bcrypt.compare(currentPassword, admin.password);
+      if (!ok) {
         return res.status(401).json({ error: 'Current password is incorrect' });
       }
       
+      const hashed = await bcrypt.hash(newPassword, 12);
       await db
         .update(users)
-        .set({ password: newPassword })
-        .where(eq(users.id, 1));
+        .set({ password: hashed })
+        .where(eq(users.id, adminUser.id));
       
       res.json({ success: true, message: 'Password changed successfully' });
     } catch (error) {
@@ -6867,7 +6946,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
   
   // Reset sales counter for the current month
-  app.post('/api/admin/reset-sales', async (req, res) => {
+  app.post('/api/admin/reset-sales', requireAdmin, async (req, res) => {
     try {
       const { sales } = await import('@shared/schema');
       const { db } = await import('./db');
@@ -6894,7 +6973,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Cleanup demo photos
-  app.delete('/api/photos/cleanup-demos', async (req, res) => {
+  app.delete('/api/photos/cleanup-demos', requireAdmin, async (req, res) => {
     try {
       const { photos } = await import('@shared/schema');
       const { db } = await import('./db');
@@ -6945,7 +7024,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ==================== PERFORMANCE OPTIMIZATION ENDPOINTS ====================
   
   // Endpoint para estadísticas de rendimiento
-  app.get('/api/admin/performance-stats', async (req, res) => {
+  app.get('/api/admin/performance-stats', requireAdmin, async (req, res) => {
     try {
       const stats = performanceMonitor.getSystemMetrics();
       const debugStats = performanceMonitor.getDebugStats();
@@ -6964,7 +7043,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para estadísticas de cache
-  app.get('/api/admin/cache-stats', async (req, res) => {
+  app.get('/api/admin/cache-stats', requireAdmin, async (req, res) => {
     try {
       const stats = (thumbnailCache as any).getStats();
       const detailedStats = (thumbnailCache as any).getDetailedStats();
@@ -6983,7 +7062,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para obtener métricas de upload en tiempo real
-  app.get('/api/admin/upload-metrics', async (req, res) => {
+  app.get('/api/admin/upload-metrics', requireAdmin, async (req, res) => {
     try {
       const uploadMetrics = performanceMonitor.getUploadMetrics();
       
@@ -6998,7 +7077,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para estadísticas de procesamiento asíncrono
-  app.get('/api/admin/async-processing-stats', async (req, res) => {
+  app.get('/api/admin/async-processing-stats', requireAdmin, async (req, res) => {
     try {
       const stats = asyncPhotoProcessor.getQueueStats();
       
@@ -7013,7 +7092,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para validar el sistema de prevención de duplicados
-  app.post('/api/admin/validate-duplicate-prevention', async (req, res) => {
+  app.post('/api/admin/validate-duplicate-prevention', requireAdmin, async (req, res) => {
     try {
       const { eventId } = req.body;
       
@@ -7038,7 +7117,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para limpieza de memoria y archivos temporales
-  app.post('/api/admin/cleanup-temp', async (req, res) => {
+  app.post('/api/admin/cleanup-temp', requireAdmin, async (req, res) => {
     try {
       const operationId = performanceMonitor.startOperation('cleanup_temp');
       
@@ -7094,7 +7173,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // API endpoint to trigger Event 8 photo import from cloud storage to database
-  app.post('/api/admin/import-event8-photos', async (req, res) => {
+  app.post('/api/admin/import-event8-photos', requireAdmin, async (req, res) => {
     console.log('🚀 [TEST] Route was reached successfully');
     
     // Set explicit JSON response headers
