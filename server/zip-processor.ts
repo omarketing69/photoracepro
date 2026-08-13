@@ -240,7 +240,7 @@ export class ZipProcessor {
     
     // Limpiar archivos temporales después de procesamiento
     try {
-      await fs.rmdir(imagesDir, { recursive: true });
+      await fs.rm(imagesDir, { recursive: true, force: true });
       console.log(`🗑️ Limpiados archivos temporales de: ${imagesDir}`);
     } catch (error) {
       console.error('Error limpiando archivos temporales:', error);

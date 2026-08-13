@@ -1,6 +1,7 @@
 import express, { type Express } from "express";
 import { createServer, type Server } from "http";
 import crypto from "crypto";
+import { extractSelfieVector, searchByFace, SelfieFaceError } from "./face-matching";
 import { storage } from "./storage";
 import { zipProcessor } from "./zip-processor";
 import { insertEventSchema, insertPhotoSchema, insertParticipantSchema, insertSaleSchema, insertPhotographerApplicationSchema, type Photo } from "@shared/schema";
@@ -1383,9 +1384,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Re-detectar SOLO caras en las fotos existentes de un evento (sin re-OCR).
   // Útil para reparar fotos subidas antes del fix que tenían `faces: []` o caras mock.
+  // Estado de los trabajos de re-detección facial en background.
+  // Persistente en memoria (se pierde al reiniciar, pero permite consultar progreso
+  // y错误; en producción conviene migrar a Redis/BD).
+  const reprocessFacesJobs = new Map<number, {
+      eventId: number;
+      status: 'running' | 'completed' | 'failed';
+      total: number;
+      processed: number;
+      skipped: number;
+      withFaces: number;
+      errors: number;
+      startedAt: Date;
+      updatedAt: Date;
+      error?: string;
+    }>();
+
   app.post("/api/events/:id/reprocess-faces", requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
+
+      // No iniciar uno nuevo si ya hay uno corriendo para este evento.
+      const existing = reprocessFacesJobs.get(eventId);
+      if (existing && existing.status === 'running') {
+        return res.status(409).json({
+          success: false,
+          error: 'Ya hay un trabajo de re-detección facial en curso para este evento',
+          job: existing,
+        });
+      }
+
       const photos = await storage.getPhotos(eventId);
 
       const { createGoogleVisionProcessor } = await import('./google-vision-ocr');
@@ -1393,56 +1421,105 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const visionProcessor = createGoogleVisionProcessor(getCloudStorage());
       const cloudStorage = getCloudStorage();
 
-      let processed = 0;
-      let withFaces = 0;
-      const stats = { skipped: 0, errors: 0 };
+      const job: {
+        eventId: number;
+        status: 'running' | 'completed' | 'failed';
+        total: number;
+        processed: number;
+        skipped: number;
+        withFaces: number;
+        errors: number;
+        startedAt: Date;
+        updatedAt: Date;
+        error?: string;
+      } = {
+        eventId,
+        status: 'running',
+        total: photos.length,
+        processed: 0,
+        skipped: 0,
+        withFaces: 0,
+        errors: 0,
+        startedAt: new Date(),
+        updatedAt: new Date(),
+      };
+      reprocessFacesJobs.set(eventId, job);
 
-      // Procesar en background para no bloquear la respuesta.
-      (async () => {
-        for (const photo of photos) {
+      // Concurrencia limitada (4 en paralelo) para no saturar Vision API ni GCS.
+      const CONCURRENCY = 4;
+
+      const processOne = async (photo: any) => {
+        try {
+          const existingFaces: any[] = Array.isArray(photo.faces) ? photo.faces : [];
+          const hasUsableFace = existingFaces.some(f => Array.isArray(f.landmarkVector) && f.landmarkVector.length > 0);
+          if (hasUsableFace) { job.skipped++; return; }
+
+          const objectName = photo.originalPath;
+          let buffer: Buffer | null = null;
           try {
-            // Saltar fotos que ya tienen landmarkVector válido
-            const existingFaces: any[] = Array.isArray(photo.faces) ? photo.faces : [];
-            const hasUsableFace = existingFaces.some(f => Array.isArray(f.landmarkVector) && f.landmarkVector.length > 0);
-            if (hasUsableFace) { stats.skipped++; continue; }
-
-            // Descargar desde GCS usando originalPath
-            const objectName = photo.originalPath;
-            let buffer: Buffer | null = null;
+            buffer = await cloudStorage.downloadFile(objectName);
+          } catch {
             try {
-              buffer = await cloudStorage.downloadFile(objectName);
-            } catch {
-              // Intentar como signed URL o path local
-              try {
-                const signedUrl = await cloudStorage.generateSignedUrl(objectName, 30);
-                const fetch = (await import('node-fetch')).default;
-                const r = await fetch(signedUrl);
-                if (r.ok) buffer = Buffer.from(await r.arrayBuffer());
-              } catch { /* leave null */ }
-            }
-            if (!buffer || buffer.length === 0) { stats.errors++; continue; }
-
-            const faces = await visionProcessor.detectFacesFromBuffer(buffer);
-            await storage.updatePhoto(photo.id, { faces });
-            processed++;
-            if (faces.length > 0) withFaces++;
-          } catch (err) {
-            stats.errors++;
-            console.warn(`⚠️ [REPROCESS-FACES] photo ${photo.id}:`, err);
+              const signedUrl = await cloudStorage.generateSignedUrl(objectName, 30);
+              const fetch = (await import('node-fetch')).default;
+              const r = await fetch(signedUrl);
+              if (r.ok) buffer = Buffer.from(await r.arrayBuffer());
+            } catch { /* leave null */ }
           }
+          if (!buffer || buffer.length === 0) { job.errors++; return; }
+
+          const faces = await visionProcessor.detectFacesFromBuffer(buffer);
+          await storage.updatePhoto(photo.id, { faces });
+          if (faces.length > 0) job.withFaces++;
+        } catch (err) {
+          job.errors++;
+          console.warn(`⚠️ [REPROCESS-FACES] photo ${photo.id}:`, err);
+        } finally {
+          job.processed++;
+          job.updatedAt = new Date();
         }
-        console.log(`✅ [REPROCESS-FACES] event ${eventId}: processed=${processed} withFaces=${withFaces} skipped=${stats.skipped} errors=${stats.errors}`);
-      })().catch(e => console.error('reprocess-faces error:', e));
+      };
+
+      // Ejecutar en background con pool de concurrencia.
+      (async () => {
+        const queue = [...photos];
+        const workers = Array.from({ length: CONCURRENCY }, async () => {
+          while (queue.length > 0) {
+            const photo = queue.shift();
+            if (photo) await processOne(photo);
+          }
+        });
+        await Promise.all(workers);
+        job.status = 'completed';
+        job.updatedAt = new Date();
+        console.log(`✅ [REPROCESS-FACES] event ${eventId}: processed=${job.processed} withFaces=${job.withFaces} skipped=${job.skipped} errors=${job.errors}`);
+      })().catch(e => {
+        job.status = 'failed';
+        job.error = e instanceof Error ? e.message : String(e);
+        job.updatedAt = new Date();
+        console.error('reprocess-faces error:', e);
+      });
 
       res.json({
         success: true,
-        message: `Re-detectando caras en ${photos.length} fotos del evento ${eventId} (en background). Revisa los logs del servidor para ver el progreso.`,
-        photosToProcess: photos.length
+        message: `Re-detectando caras en ${photos.length} fotos del evento ${eventId} (en background). Consulta GET /api/events/${eventId}/reprocess-faces/status para ver el progreso.`,
+        jobId: eventId,
+        photosToProcess: photos.length,
       });
     } catch (error) {
       console.error("Error reprocessing faces:", error);
       res.status(500).json({ message: "Failed to reprocess faces", error: error instanceof Error ? error.message : String(error) });
     }
+  });
+
+  // Estado del trabajo de re-detección facial.
+  app.get("/api/events/:id/reprocess-faces/status", requireAdmin, async (req, res) => {
+    const eventId = parseInt(req.params.id);
+    const job = reprocessFacesJobs.get(eventId);
+    if (!job) {
+      return res.status(404).json({ error: 'No hay trabajo de re-detección facial para este evento' });
+    }
+    res.json(job);
   });
 
   // Función auxiliar para procesar con OCR mejorado
@@ -2246,7 +2323,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para sincronizar fotos de Google Cloud Storage con la base de datos
-  app.post("/api/events/:id/sync-cloud-photos", async (req, res) => {
+  app.post("/api/events/:id/sync-cloud-photos", requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       
@@ -2541,7 +2618,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ZIP upload routes
   const zipUpload = multer({
     dest: path.join(process.cwd(), 'temp'),
-    limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB limit
+    limits: { fileSize: 1024 * 1024 * 1024 }, // 1GB limit (alineado con el límite de Cloud Storage)
     fileFilter: (req, file, cb) => {
       if (file.mimetype === 'application/zip' || 
           file.mimetype === 'application/x-zip-compressed' ||
@@ -4726,7 +4803,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Bulk photo upload endpoint
-  app.post('/api/photos/bulk-upload', bulkUpload.array('photos', 200), async (req, res) => {
+  app.post('/api/photos/bulk-upload', requireRoles(['admin', 'photographer']), bulkUpload.array('photos', 200), async (req, res) => {
     try {
       const files = req.files as Express.Multer.File[];
       const eventId = parseInt(req.body.eventId) || 1;
@@ -6097,8 +6174,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify event has free photos enabled
-      const { events, photos: photosSchema } = await import('@shared/schema');
-      const { db } = await import('./db');
+      const { events } = await import('@shared/schema');
       const { eq, and } = await import('drizzle-orm');
 
       const [event] = await db
@@ -6110,145 +6186,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: 'Evento no encontrado o fotos gratuitas no habilitadas' });
       }
 
-      // Convert HEIC if needed
-      let imageBuffer = req.file.buffer;
-      const { HeicConverter } = await import('./heic-converter');
-      if (HeicConverter.isHeicFile(req.file)) {
-        imageBuffer = await HeicConverter.convertToJpeg(imageBuffer);
-      }
-
-      // Detect faces in the uploaded selfie
-      const { createGoogleVisionProcessor } = await import('./google-vision-ocr');
-      const { getCloudStorage: getFaceCloudStorage } = await import('./cloud-storage');
-      const faceCloudStorage = getFaceCloudStorage();
-      const visionProcessor = createGoogleVisionProcessor(faceCloudStorage);
-
-      console.log(`🔍 [FACE-SEARCH] Detecting faces in selfie for event ${eventId}`);
-      const selfieFaces = await visionProcessor.detectFacesFromBuffer(imageBuffer);
-
-      if (selfieFaces.length === 0) {
-        return res.status(400).json({
-          error: 'No se detectó ninguna cara en la foto. Por favor sube una foto clara de tu cara.',
-          selfieFacesFound: 0
-        });
-      }
-
-      // Use the largest face from the selfie (by bounding-box area)
-      const selfieFace = selfieFaces.reduce((best, f) => (f.width * f.height > best.width * best.height ? f : best));
-      const selfieVector = selfieFace.landmarkVector;
-
-      if (!selfieVector || selfieVector.length === 0) {
-        return res.status(400).json({
-          error: 'No se pudieron extraer características faciales. Por favor intenta con otra foto.',
-          selfieFacesFound: selfieFaces.length
-        });
-      }
-
-      console.log(`✅ [FACE-SEARCH] Selfie face detected, landmark vector length: ${selfieVector.length}`);
-
-      // Query photos from this event that have face landmark data
-      const photosWithFaces = await db
-        .select({
-          id: photosSchema.id,
-          filename: photosSchema.filename,
-          originalPath: photosSchema.originalPath,
-          webPath: photosSchema.webPath,
-          thumbnailPath: photosSchema.thumbnailPath,
-          detectedDorsals: photosSchema.detectedDorsals,
-          faces: photosSchema.faces
-        })
-        .from(photosSchema)
-        .where(eq(photosSchema.eventId, eventId));
-
-      console.log(`🔍 [FACE-SEARCH] Scanning ${photosWithFaces.length} photos for face matches`);
-
-      // Cosine similarity between two vectors (scale/magnitude-invariant, robust to pose/lighting noise)
-      function cosineSimilarity(a: number[], b: number[]): number {
-        if (a.length !== b.length || a.length === 0) return 0;
-        let dot = 0, magA = 0, magB = 0;
-        for (let i = 0; i < a.length; i++) {
-          dot  += a[i] * b[i];
-          magA += a[i] * a[i];
-          magB += b[i] * b[i];
-        }
-        if (magA === 0 || magB === 0) return 0;
-        return dot / (Math.sqrt(magA) * Math.sqrt(magB));
-      }
-
-      // Thresholds expressed as minimum cosine similarity (higher = stricter, 0–1 scale).
-      // Calibration notes:
-      //   • Cosine similarity on the 14-dim landmark vector is scale/pose-invariant.
-      //   • Race conditions (hats, motion blur, angles) typically reduce similarity by ~0.10–0.15
-      //     compared to a clear selfie pair. Empirical calibration against real race photos should
-      //     target precision ≥ 0.85 at the normal threshold and recall ≥ 0.80 at the relaxed threshold.
-      //   • Starting values (0.70 / 0.55) were chosen conservatively — adjust based on logged
-      //     match-score distributions from production searches (see proposeFollowUpTask #5).
       const isRelaxed = req.query.relaxed === 'true';
-      const SIMILARITY_THRESHOLD = isRelaxed ? 0.45 : 0.55; // cosine similarity (0–1)
-      // Umbrales calibrados para landmarks normalizados (no embeddings). Fotos de
-      // carrera suelen tener ángulos laterales/blur que reducen similitud vs selfie frontal.
 
-      const results: Array<{
-        photoId: number;
-        filename: string;
-        originalPath: string;
-        webPath?: string;
-        thumbnailPath?: string;
-        detectedDorsals: number[];
-        similarity: number;
-        cosineSimilarity: number;
-      }> = [];
+      try {
+        const { selfieFacesFound, landmarkVector } = await extractSelfieVector(req.file.buffer);
+        console.log(`✅ [FACE-SEARCH] Selfie face detected for event ${eventId} (free). landmark vector length: ${landmarkVector.length}`);
 
-      for (const photo of photosWithFaces) {
-        const facesData = photo.faces;
-        if (!facesData || !Array.isArray(facesData) || facesData.length === 0) continue;
+        const result = await searchByFace(eventId, landmarkVector, { relaxed: isRelaxed });
+        console.log(`✅ [FACE-SEARCH] Event ${eventId}: ${result.totalMatches} matches (relaxed: ${isRelaxed}, ${result.stats.photosWithFaceData} photos had face data)`);
 
-        let bestSimilarity = -Infinity;
-        for (const face of facesData) {
-          const vec = face.landmarkVector;
-          if (!vec || !Array.isArray(vec) || vec.length === 0) continue;
-          const sim = cosineSimilarity(selfieVector, vec);
-          if (sim > bestSimilarity) bestSimilarity = sim;
+        res.json({
+          matches: result.matches,
+          totalMatches: result.totalMatches,
+          photosScanned: result.stats.photosScanned,
+          photosWithFaceData: result.stats.photosWithFaceData,
+          selfieFacesFound,
+          isRelaxed,
+        });
+      } catch (err) {
+        if (err instanceof SelfieFaceError) {
+          return res.status(400).json({ error: err.message, selfieFacesFound: err.selfieFacesFound });
         }
-
-        if (bestSimilarity >= SIMILARITY_THRESHOLD) {
-          // Map cosine similarity to a 0–100 score within the expected range
-          const minExpected = isRelaxed ? 0.30 : 0.40; // alinear con el nuevo threshold
-          const similarity = Math.max(0, Math.min(100, Math.round(
-            ((bestSimilarity - minExpected) / (1 - minExpected)) * 100
-          )));
-          results.push({
-            photoId: photo.id,
-            filename: photo.filename,
-            originalPath: photo.originalPath,
-            webPath: photo.webPath ?? undefined,
-            thumbnailPath: photo.thumbnailPath ?? undefined,
-            detectedDorsals: (photo.detectedDorsals as number[]) ?? [],
-            similarity,
-            cosineSimilarity: Math.round(bestSimilarity * 1000) / 1000
-          });
-        }
+        throw err;
       }
-
-      // Sort by similarity (highest first)
-      results.sort((a, b) => b.similarity - a.similarity);
-
-      console.log(`✅ [FACE-SEARCH] Found ${results.length} matching photos (cosine threshold: ${SIMILARITY_THRESHOLD}, relaxed: ${isRelaxed})`);
-
-      // Count how many photos actually had face data
-      const photosWithFaceData = photosWithFaces.filter(p => {
-        const faces = p.faces;
-        return Array.isArray(faces) && faces.length > 0 && faces.some(face => (face.landmarkVector?.length ?? 0) > 0);
-      }).length;
-
-      res.json({
-        matches: results.slice(0, 50), // Limit to top 50 results
-        totalMatches: results.length,
-        photosScanned: photosWithFaces.length,
-        photosWithFaceData,
-        selfieFacesFound: selfieFaces.length,
-        isRelaxed
-      });
 
     } catch (error) {
       console.error('❌ [FACE-SEARCH] Error in face search:', error);
@@ -6266,139 +6226,37 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Se requiere una foto (selfie)' });
       }
 
-      const { events: eventsSchema, photos: photosSchema } = await import('@shared/schema');
-      const { db } = await import('./db');
-      const { eq } = await import('drizzle-orm');
+      const { events } = await import('@shared/schema');
 
-      const [event] = await db.select().from(eventsSchema).where(eq(eventsSchema.id, eventId));
+      const [event] = await db.select().from(events).where(eq(events.id, eventId));
       if (!event) {
         return res.status(404).json({ error: 'Evento no encontrado' });
       }
 
-      // Convert HEIC if needed
-      let imageBuffer = req.file.buffer;
-      const { HeicConverter } = await import('./heic-converter');
-      if (HeicConverter.isHeicFile(req.file)) {
-        imageBuffer = await HeicConverter.convertToJpeg(imageBuffer);
-      }
-
-      const { createGoogleVisionProcessor } = await import('./google-vision-ocr');
-      const { getCloudStorage: getFaceCloudStorage2 } = await import('./cloud-storage');
-      const visionProcessor = createGoogleVisionProcessor(getFaceCloudStorage2());
-
-      console.log(`🔍 [FACE-SEARCH] Detecting faces in selfie for event ${eventId} (isFreeEvent: ${event.freePhotosEnabled})`);
-      const selfieFaces = await visionProcessor.detectFacesFromBuffer(imageBuffer);
-
-      if (selfieFaces.length === 0) {
-        return res.status(400).json({
-          error: 'No se detectó ninguna cara en la foto. Por favor sube una foto clara de tu cara.',
-          selfieFacesFound: 0
-        });
-      }
-
-      const selfieFace = selfieFaces.reduce((best, f) => (f.width * f.height > best.width * best.height ? f : best));
-      const selfieVector = selfieFace.landmarkVector;
-
-      if (!selfieVector || selfieVector.length === 0) {
-        return res.status(400).json({
-          error: 'No se pudieron extraer características faciales. Por favor intenta con otra foto.',
-          selfieFacesFound: selfieFaces.length
-        });
-      }
-
-      console.log(`✅ [FACE-SEARCH] Selfie face detected, landmark vector length: ${selfieVector.length}`);
-
-      const photosWithFaces = await db
-        .select({
-          id: photosSchema.id,
-          filename: photosSchema.filename,
-          originalPath: photosSchema.originalPath,
-          webPath: photosSchema.webPath,
-          thumbnailPath: photosSchema.thumbnailPath,
-          detectedDorsals: photosSchema.detectedDorsals,
-          faces: photosSchema.faces
-        })
-        .from(photosSchema)
-        .where(eq(photosSchema.eventId, eventId));
-
-      console.log(`🔍 [FACE-SEARCH] Scanning ${photosWithFaces.length} photos for event ${eventId}`);
-
-      // Cosine similarity — scale/magnitude-invariant, more robust than Euclidean distance
-      // for face landmark vectors under varying race conditions (hats, angles, motion blur)
-      function cosineSimilarity(a: number[], b: number[]): number {
-        if (a.length !== b.length || a.length === 0) return 0;
-        let dot = 0, magA = 0, magB = 0;
-        for (let i = 0; i < a.length; i++) {
-          dot  += a[i] * b[i];
-          magA += a[i] * a[i];
-          magB += b[i] * b[i];
-        }
-        if (magA === 0 || magB === 0) return 0;
-        return dot / (Math.sqrt(magA) * Math.sqrt(magB));
-      }
-
       const isRelaxed = req.query.relaxed === 'true';
-      const SIMILARITY_THRESHOLD = isRelaxed ? 0.45 : 0.55; // cosine similarity (0–1)
-      // Umbrales calibrados para landmarks normalizados (no embeddings). Fotos de
-      // carrera suelen tener ángulos laterales/blur que reducen similitud vs selfie frontal.
 
-      const results: Array<{
-        photoId: number;
-        filename: string;
-        originalPath: string;
-        webPath?: string;
-        thumbnailPath?: string;
-        detectedDorsals: number[];
-        similarity: number;
-        cosineSimilarity: number;
-      }> = [];
+      try {
+        const { selfieFacesFound, landmarkVector } = await extractSelfieVector(req.file.buffer);
+        console.log(`✅ [FACE-SEARCH] Selfie face detected for event ${eventId} (isFreeEvent: ${event.freePhotosEnabled}). landmark vector length: ${landmarkVector.length}`);
 
-      for (const photo of photosWithFaces) {
-        const facesData = photo.faces;
-        if (!facesData || !Array.isArray(facesData) || facesData.length === 0) continue;
-        let bestSimilarity = -Infinity;
-        for (const face of facesData) {
-          const vec = face.landmarkVector;
-          if (!vec || !Array.isArray(vec) || vec.length === 0) continue;
-          const sim = cosineSimilarity(selfieVector, vec);
-          if (sim > bestSimilarity) bestSimilarity = sim;
+        const result = await searchByFace(eventId, landmarkVector, { relaxed: isRelaxed });
+        console.log(`✅ [FACE-SEARCH] Event ${eventId}: ${result.totalMatches} matches (relaxed: ${isRelaxed}, ${result.stats.photosWithFaceData} photos had face data)`);
+
+        res.json({
+          matches: result.matches,
+          totalMatches: result.totalMatches,
+          photosScanned: result.stats.photosScanned,
+          photosWithFaceData: result.stats.photosWithFaceData,
+          selfieFacesFound,
+          isFreeEvent: event.freePhotosEnabled,
+          isRelaxed,
+        });
+      } catch (err) {
+        if (err instanceof SelfieFaceError) {
+          return res.status(400).json({ error: err.message, selfieFacesFound: err.selfieFacesFound });
         }
-        if (bestSimilarity >= SIMILARITY_THRESHOLD) {
-          const minExpected = isRelaxed ? 0.30 : 0.40; // alinear con el nuevo threshold
-          const similarity = Math.max(0, Math.min(100, Math.round(
-            ((bestSimilarity - minExpected) / (1 - minExpected)) * 100
-          )));
-          results.push({
-            photoId: photo.id,
-            filename: photo.filename,
-            originalPath: photo.originalPath,
-            webPath: photo.webPath ?? undefined,
-            thumbnailPath: photo.thumbnailPath ?? undefined,
-            detectedDorsals: (photo.detectedDorsals as number[]) ?? [],
-            similarity,
-            cosineSimilarity: Math.round(bestSimilarity * 1000) / 1000
-          });
-        }
+        throw err;
       }
-
-      results.sort((a, b) => b.similarity - a.similarity);
-
-      const photosWithFaceData = photosWithFaces.filter(p => {
-        const faces = p.faces;
-        return Array.isArray(faces) && faces.length > 0 && faces.some(face => (face.landmarkVector?.length ?? 0) > 0);
-      }).length;
-
-      console.log(`✅ [FACE-SEARCH] Event ${eventId}: ${results.length} matches (cosine threshold: ${SIMILARITY_THRESHOLD}, relaxed: ${isRelaxed}, ${photosWithFaceData} photos had face data)`);
-
-      res.json({
-        matches: results.slice(0, 50),
-        totalMatches: results.length,
-        photosScanned: photosWithFaces.length,
-        photosWithFaceData,
-        selfieFacesFound: selfieFaces.length,
-        isFreeEvent: event.freePhotosEnabled,
-        isRelaxed
-      });
 
     } catch (error) {
       console.error('❌ [FACE-SEARCH] Error in paid event face search:', error);

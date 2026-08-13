@@ -4,6 +4,7 @@ import fs from 'fs';
 import sharp from 'sharp';
 import { storage } from './storage';
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { getCloudStorage } from './cloud-storage';
 
 // Configuración de multer para guardar archivos localmente
 const localStorage = multer.diskStorage({
@@ -45,7 +46,7 @@ export const localUpload = multer({
 export async function processSimpleUpload(eventId: number, files: Express.Multer.File[]) {
   console.log(`🔄 Procesando ${files.length} fotos para evento ${eventId}`);
   
-  const googleVisionProcessor = new GoogleVisionOCRProcessor();
+  const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
   const results = [];
   
   for (const file of files) {

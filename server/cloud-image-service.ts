@@ -57,6 +57,7 @@ export class CloudImageService {
       const thumbnailCloudPath = await this.cloudStorage.uploadThumbnail(eventId, originalCloudPath, thumbnailBuffer);
       
       // 4. Procesar OCR con Google Vision si no hay dorsales detectados
+      let ocrProcessor: GoogleVisionOCRProcessor | null = null;
       if (detectedDorsals.length === 0) {
         let tempFilePath: string | null = null;
         try {
@@ -65,16 +66,15 @@ export class CloudImageService {
           const fs = await import('fs');
           tempFilePath = `/tmp/${Date.now()}-${photoFile.originalname}`;
           fs.writeFileSync(tempFilePath, photoFile.buffer);
-          
-          const { GoogleVisionOCRProcessor } = await import('./google-vision-ocr');
-          const googleVisionProcessor = new GoogleVisionOCRProcessor(this.cloudStorage);
+
+          ocrProcessor = new GoogleVisionOCRProcessor(this.cloudStorage);
           const ocrStart = Date.now();
-          const ocrResult = await googleVisionProcessor.processImage(tempFilePath);
+          const ocrResult = await ocrProcessor.processImage(tempFilePath);
           const ocrTime = Date.now() - ocrStart;
-          
+
           detectedDorsals = ocrResult.dorsalNumbers;
           console.log(`✅ OCR completado para ${photoFile.originalname}: ${detectedDorsals.length} dorsales detectados (${ocrTime}ms)`);
-          
+
           // Registrar métricas de OCR
           performanceMonitor.recordPhotoProcessed(photoFile.originalname, ocrTime, detectedDorsals.length > 0);
         } catch (error) {
@@ -95,6 +95,19 @@ export class CloudImageService {
           }
         }
       }
+
+      // 4b. Detección facial REAL en el mismo request.
+      // Antes este flujo dejaba `faces: []` y dependía de asyncPhotoProcessor (cola
+      // que puede fallar con HEIC o variaciones). Garantizar caras aquí evita que
+      // las fotos subidas por ZIP queden sin reconocimiento facial.
+      let detectedFaces: Awaited<ReturnType<GoogleVisionOCRProcessor['detectFacesFromBuffer']>> = [];
+      try {
+        const visionProcessor = ocrProcessor ?? new GoogleVisionOCRProcessor(this.cloudStorage);
+        detectedFaces = await visionProcessor.detectFacesFromBuffer(photoFile.buffer);
+        console.log(`👤 [FACE] ${photoFile.originalname}: ${detectedFaces.length} face(s) detectadas (cloud-image-service)`);
+      } catch (faceErr) {
+        console.warn(`⚠️ [FACE] No se pudieron detectar caras para ${photoFile.originalname}:`, faceErr);
+      }
       
       // 5. Crear registro en base de datos con URLs de la nube
       const photo = await storage.createPhoto({
@@ -104,8 +117,8 @@ export class CloudImageService {
         webPath: webCloudPath,
         thumbnailPath: thumbnailCloudPath,
         detectedDorsals,
-        faces: [],
-        processed: detectedDorsals.length > 0,
+        faces: detectedFaces,
+        processed: detectedDorsals.length > 0 || detectedFaces.length > 0,
         processingStatus: detectedDorsals.length > 0 ? 'completed' : 'pending',
       });
       

@@ -73,7 +73,7 @@ app.use(express.json({
 
 app.use(express.urlencoded({
   extended: false,
-  limit: '5gb'
+  limit: '1mb'
 }));
 
 // Configurar timeout para requests largos - optimizado para 200 fotos

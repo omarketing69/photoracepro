@@ -3,6 +3,7 @@ import path from 'path';
 import { storage } from './storage';
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
 import { imageService } from './image-service';
+import { getCloudStorage } from './cloud-storage';
 
 // Configure multer for bulk photo uploads
 const bulkUpload = multer({
@@ -61,7 +62,7 @@ export class ManualUploadProcessor {
         const photo = await storage.createPhoto(photoData);
 
         // Process with Google Vision OCR
-        const googleVisionProcessor = new GoogleVisionOCRProcessor();
+        const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
         const ocrResult = await googleVisionProcessor.processImage(file.path);
 
         // Detección facial real — antes este flujo dejaba `faces: []` y la búsqueda
