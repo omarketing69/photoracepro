@@ -64,13 +64,28 @@ export class ManualUploadProcessor {
         const googleVisionProcessor = new GoogleVisionOCRProcessor();
         const ocrResult = await googleVisionProcessor.processImage(file.path);
 
+        // Detección facial real — antes este flujo dejaba `faces: []` y la búsqueda
+        // por selfie nunca encontraba caras en estas fotos.
+        let detectedFaces: Awaited<ReturnType<GoogleVisionOCRProcessor['detectFacesFromBuffer']>> = [];
+        try {
+          const fsSync = await import('fs');
+          if (fsSync.existsSync(file.path)) {
+            const buffer = fsSync.readFileSync(file.path);
+            detectedFaces = await googleVisionProcessor.detectFacesFromBuffer(buffer);
+            console.log(`👤 [FACE] Photo ${photo.id}: ${detectedFaces.length} face(s) detected (manual-upload)`);
+          }
+        } catch (faceErr) {
+          console.warn(`⚠️ [FACE] No se pudieron detectar caras para photo ${photo.id}:`, faceErr);
+        }
+
         if (ocrResult.dorsalNumbers.length > 0) {
           // Generate thumbnail
           const thumbnailPath = await imageService.generateThumbnail(file.path, file.originalname);
-          
-          // Update photo with results
+
+          // Update photo with results (incluyendo caras detectadas)
           await storage.updatePhoto(photo.id, {
             detectedDorsals: ocrResult.dorsalNumbers,
+            faces: detectedFaces,
             thumbnailPath,
             processed: true,
             processingStatus: 'completed'
@@ -82,11 +97,12 @@ export class ManualUploadProcessor {
           console.log(`✅ Detectados ${ocrResult.dorsalNumbers.length} dorsales: [${ocrResult.dorsalNumbers.join(', ')}]`);
         } else {
           await storage.updatePhoto(photo.id, {
+            faces: detectedFaces,
             processed: true,
             processingStatus: 'no_dorsals_found'
           });
 
-          console.log(`❌ Sin dorsales detectados`);
+          console.log(`❌ Sin dorsales detectados (pero ${detectedFaces.length} cara(s) guardadas)`);
         }
 
         processedCount++;

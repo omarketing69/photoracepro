@@ -79,7 +79,20 @@ export async function processSimpleUpload(eventId: number, files: Express.Multer
       
       // 2. Procesar con Google Vision OCR
       const ocrResult = await googleVisionProcessor.processImage(file.path);
-      
+
+      // 2b. Detección facial real. Antes este flujo guardaba `faces: []` y la
+      // búsqueda por selfie nunca encontraba caras en estas fotos.
+      let detectedFaces: Awaited<ReturnType<GoogleVisionOCRProcessor['detectFacesFromBuffer']>> = [];
+      try {
+        if (fs.existsSync(file.path)) {
+          const buffer = fs.readFileSync(file.path);
+          detectedFaces = await googleVisionProcessor.detectFacesFromBuffer(buffer);
+          console.log(`👤 [FACE] ${file.originalname}: ${detectedFaces.length} face(s) detectadas (simple-upload)`);
+        }
+      } catch (faceErr) {
+        console.warn(`⚠️ [FACE] No se pudieron detectar caras para ${file.originalname}:`, faceErr);
+      }
+
       // 3. Guardar en base de datos con todas las versiones
       const photo = await storage.createPhoto({
         eventId,
@@ -88,7 +101,7 @@ export async function processSimpleUpload(eventId: number, files: Express.Multer
         webPath: webPath, // Versión web optimizada
         thumbnailPath: thumbnailPath, // Miniatura
         detectedDorsals: ocrResult.dorsalNumbers,
-        faces: [],
+        faces: detectedFaces,
         processed: true,
         processingStatus: 'completed'
       });

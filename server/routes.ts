@@ -1332,7 +1332,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para reprocesar fotos con OCR real
-  app.post("/api/events/:id/reprocess", async (req, res) => {
+  app.post("/api/events/:id/reprocess", requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       const photos = await storage.getPhotos(eventId);
@@ -1359,11 +1359,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Endpoint para reprocesar todas las fotos con OCR real (forzado)
-  app.post("/api/events/:id/reprocess-all", async (req, res) => {
+  app.post("/api/events/:id/reprocess-all", requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       const photos = await storage.getPhotos(eventId);
-      
+
       // Procesar todas las fotos con OCR real, incluso las que ya tienen dorsales
       photos.forEach((photo, index) => {
         setTimeout(() => processPhotoWithOCR(photo.id, photo.originalPath), 1000 * index);
@@ -1378,6 +1378,70 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("Error reprocessing all photos:", error);
       res.status(500).json({ message: "Failed to reprocess all photos" });
+    }
+  });
+
+  // Re-detectar SOLO caras en las fotos existentes de un evento (sin re-OCR).
+  // Útil para reparar fotos subidas antes del fix que tenían `faces: []` o caras mock.
+  app.post("/api/events/:id/reprocess-faces", requireAdmin, async (req, res) => {
+    try {
+      const eventId = parseInt(req.params.id);
+      const photos = await storage.getPhotos(eventId);
+
+      const { createGoogleVisionProcessor } = await import('./google-vision-ocr');
+      const { getCloudStorage } = await import('./cloud-storage');
+      const visionProcessor = createGoogleVisionProcessor(getCloudStorage());
+      const cloudStorage = getCloudStorage();
+
+      let processed = 0;
+      let withFaces = 0;
+      const stats = { skipped: 0, errors: 0 };
+
+      // Procesar en background para no bloquear la respuesta.
+      (async () => {
+        for (const photo of photos) {
+          try {
+            // Saltar fotos que ya tienen landmarkVector válido
+            const existingFaces: any[] = Array.isArray(photo.faces) ? photo.faces : [];
+            const hasUsableFace = existingFaces.some(f => Array.isArray(f.landmarkVector) && f.landmarkVector.length > 0);
+            if (hasUsableFace) { stats.skipped++; continue; }
+
+            // Descargar desde GCS usando originalPath
+            const objectName = photo.originalPath;
+            let buffer: Buffer | null = null;
+            try {
+              buffer = await cloudStorage.downloadFile(objectName);
+            } catch {
+              // Intentar como signed URL o path local
+              try {
+                const signedUrl = await cloudStorage.generateSignedUrl(objectName, 30);
+                const fetch = (await import('node-fetch')).default;
+                const r = await fetch(signedUrl);
+                if (r.ok) buffer = Buffer.from(await r.arrayBuffer());
+              } catch { /* leave null */ }
+            }
+            if (!buffer || buffer.length === 0) { stats.errors++; continue; }
+
+            const faces = await visionProcessor.detectFacesFromBuffer(buffer);
+            await storage.updatePhoto(photo.id, { faces });
+            processed++;
+            if (faces.length > 0) withFaces++;
+          } catch (err) {
+            stats.errors++;
+            console.warn(`⚠️ [REPROCESS-FACES] photo ${photo.id}:`, err);
+          }
+        }
+        console.log(`✅ [REPROCESS-FACES] event ${eventId}: processed=${processed} withFaces=${withFaces} skipped=${stats.skipped} errors=${stats.errors}`);
+      })().catch(e => console.error('reprocess-faces error:', e));
+
+      res.json({
+        success: true,
+        message: `Re-detectando caras en ${photos.length} fotos del evento ${eventId} (en background). Revisa los logs del servidor para ver el progreso.`,
+        photosToProcess: photos.length
+      });
+    } catch (error) {
+      console.error("Error reprocessing faces:", error);
+      res.status(500).json({ message: "Failed to reprocess faces", error: error instanceof Error ? error.message : String(error) });
     }
   });
 
@@ -1461,7 +1525,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   }
 
   // Endpoint para reprocesar todas las fotos con OCR mejorado
-  app.post("/api/events/:id/reprocess-enhanced", async (req, res) => {
+  app.post("/api/events/:id/reprocess-enhanced", requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       const photos = await storage.getPhotos(eventId);
@@ -1516,7 +1580,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   }
 
   // Endpoint para reprocesar todas las fotos con Super OCR
-  app.post("/api/events/:id/reprocess-super", async (req, res) => {
+  app.post("/api/events/:id/reprocess-super", requireAdmin, async (req, res) => {
     try {
       const eventId = parseInt(req.params.id);
       const photos = await storage.getPhotos(eventId);
@@ -6120,7 +6184,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       //   • Starting values (0.70 / 0.55) were chosen conservatively — adjust based on logged
       //     match-score distributions from production searches (see proposeFollowUpTask #5).
       const isRelaxed = req.query.relaxed === 'true';
-      const SIMILARITY_THRESHOLD = isRelaxed ? 0.55 : 0.70; // cosine similarity (0–1)
+      const SIMILARITY_THRESHOLD = isRelaxed ? 0.45 : 0.55; // cosine similarity (0–1)
+      // Umbrales calibrados para landmarks normalizados (no embeddings). Fotos de
+      // carrera suelen tener ángulos laterales/blur que reducen similitud vs selfie frontal.
 
       const results: Array<{
         photoId: number;
@@ -6147,7 +6213,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         if (bestSimilarity >= SIMILARITY_THRESHOLD) {
           // Map cosine similarity to a 0–100 score within the expected range
-          const minExpected = isRelaxed ? 0.40 : 0.60;
+          const minExpected = isRelaxed ? 0.30 : 0.40; // alinear con el nuevo threshold
           const similarity = Math.max(0, Math.min(100, Math.round(
             ((bestSimilarity - minExpected) / (1 - minExpected)) * 100
           )));
@@ -6272,7 +6338,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const isRelaxed = req.query.relaxed === 'true';
-      const SIMILARITY_THRESHOLD = isRelaxed ? 0.55 : 0.70; // cosine similarity (0–1)
+      const SIMILARITY_THRESHOLD = isRelaxed ? 0.45 : 0.55; // cosine similarity (0–1)
+      // Umbrales calibrados para landmarks normalizados (no embeddings). Fotos de
+      // carrera suelen tener ángulos laterales/blur que reducen similitud vs selfie frontal.
 
       const results: Array<{
         photoId: number;
@@ -6296,7 +6364,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           if (sim > bestSimilarity) bestSimilarity = sim;
         }
         if (bestSimilarity >= SIMILARITY_THRESHOLD) {
-          const minExpected = isRelaxed ? 0.40 : 0.60;
+          const minExpected = isRelaxed ? 0.30 : 0.40; // alinear con el nuevo threshold
           const similarity = Math.max(0, Math.min(100, Math.round(
             ((bestSimilarity - minExpected) / (1 - minExpected)) * 100
           )));
