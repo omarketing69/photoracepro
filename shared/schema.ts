@@ -13,6 +13,7 @@ export const events = pgTable("events", {
   freePhotosEnabled: boolean("free_photos_enabled").default(false),
   freePhotosEnabledAt: timestamp("free_photos_enabled_at"),
   requiresAthleteLogin: boolean("requires_athlete_login").default(false), // For paid events requiring athlete auth
+  maxDorsalNumber: integer("max_dorsal_number").default(1600), // Upper bound for valid bib numbers detected by OCR
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
@@ -243,7 +244,6 @@ export const insertEventSchema = createInsertSchema(events).omit({
 export const insertPhotoSchema = createInsertSchema(photos).omit({
   id: true,
   uploadedAt: true,
-  processedAt: true,
 });
 
 export const insertParticipantSchema = createInsertSchema(participants).omit({

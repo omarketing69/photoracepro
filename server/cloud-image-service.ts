@@ -1,9 +1,10 @@
 import sharp from 'sharp';
 import { getCloudStorage } from './cloud-storage';
 import { storage } from './storage';
-import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { GoogleVisionOCRProcessor, DEFAULT_MAX_DORSAL } from './google-vision-ocr';
 import { performanceMonitor } from './performance-monitor';
 import { HeicConverter } from './heic-converter';
+import { derivePhotoProcessingState } from './photo-processing-state';
 
 export class CloudImageService {
   private cloudStorage = getCloudStorage();
@@ -20,6 +21,11 @@ export class CloudImageService {
     originalUrl: string;
     webUrl: string;
     thumbnailUrl: string;
+    // Whether the OCR / face-detection Vision API calls made in this pass
+    // completed without error. Callers use this to decide whether the photo
+    // still needs a retry pass (e.g. via the async queue) or is fully resolved.
+    ocrSucceeded: boolean;
+    facesSucceeded: boolean;
   }> {
     console.log(`🔍 [CloudImageService] Iniciando procesamiento para: ${photoFile.originalname}`);
     console.log(`🔍 [CloudImageService] Tamaño archivo: ${photoFile.buffer.length} bytes`);
@@ -56,9 +62,18 @@ export class CloudImageService {
       
       const thumbnailCloudPath = await this.cloudStorage.uploadThumbnail(eventId, originalCloudPath, thumbnailBuffer);
       
+      // Resolve the per-event dorsal ceiling (falls back to the platform default
+      // when the event has none set, e.g. events created before this field existed).
+      const event = await storage.getEvent(eventId);
+      const maxDorsal = event?.maxDorsalNumber ?? DEFAULT_MAX_DORSAL;
+
       // 4. Procesar OCR con Google Vision si no hay dorsales detectados
       let ocrProcessor: GoogleVisionOCRProcessor | null = null;
+      let ocrAttempted = false;
+      let ocrSucceeded = true; // no attempt made this pass ≠ a failure
       if (detectedDorsals.length === 0) {
+        ocrAttempted = true;
+        ocrSucceeded = false;
         let tempFilePath: string | null = null;
         try {
           console.log(`🔍 Procesando OCR para: ${photoFile.originalname}`);
@@ -69,17 +84,18 @@ export class CloudImageService {
 
           ocrProcessor = new GoogleVisionOCRProcessor(this.cloudStorage);
           const ocrStart = Date.now();
-          const ocrResult = await ocrProcessor.processImage(tempFilePath);
+          const ocrResult = await ocrProcessor.processImage(tempFilePath, maxDorsal);
           const ocrTime = Date.now() - ocrStart;
 
           detectedDorsals = ocrResult.dorsalNumbers;
-          console.log(`✅ OCR completado para ${photoFile.originalname}: ${detectedDorsals.length} dorsales detectados (${ocrTime}ms)`);
+          ocrSucceeded = ocrResult.success;
+          console.log(`✅ OCR completado para ${photoFile.originalname}: ${detectedDorsals.length} dorsales detectados (${ocrTime}ms, success=${ocrSucceeded})`);
 
           // Registrar métricas de OCR
           performanceMonitor.recordPhotoProcessed(photoFile.originalname, ocrTime, detectedDorsals.length > 0);
         } catch (error) {
           console.error(`❌ Error en OCR para ${photoFile.originalname}:`, error);
-          // Continuar sin OCR - foto se sube sin dorsales
+          // ocrSucceeded queda en false - el caller decidirá si reintenta vía cola
         } finally {
           // Garantizar limpieza del archivo temporal
           if (tempFilePath) {
@@ -101,14 +117,25 @@ export class CloudImageService {
       // que puede fallar con HEIC o variaciones). Garantizar caras aquí evita que
       // las fotos subidas por ZIP queden sin reconocimiento facial.
       let detectedFaces: Awaited<ReturnType<GoogleVisionOCRProcessor['detectFacesFromBuffer']>> = [];
+      let facesSucceeded = false;
       try {
         const visionProcessor = ocrProcessor ?? new GoogleVisionOCRProcessor(this.cloudStorage);
-        detectedFaces = await visionProcessor.detectFacesFromBuffer(photoFile.buffer);
-        console.log(`👤 [FACE] ${photoFile.originalname}: ${detectedFaces.length} face(s) detectadas (cloud-image-service)`);
+        const faceResult = await visionProcessor.detectFacesFromBufferWithStatus(photoFile.buffer);
+        detectedFaces = faceResult.faces;
+        facesSucceeded = faceResult.success;
+        console.log(`👤 [FACE] ${photoFile.originalname}: ${detectedFaces.length} face(s) detectadas (cloud-image-service, success=${facesSucceeded})`);
       } catch (faceErr) {
         console.warn(`⚠️ [FACE] No se pudieron detectar caras para ${photoFile.originalname}:`, faceErr);
+        // facesSucceeded queda en false - el caller decidirá si reintenta vía cola
       }
-      
+
+      const { processed, processingStatus, processedAt } = derivePhotoProcessingState({
+        ocrAttempted,
+        ocrSucceeded,
+        facesAttempted: true,
+        facesSucceeded,
+      });
+
       // 5. Crear registro en base de datos con URLs de la nube
       const photo = await storage.createPhoto({
         eventId,
@@ -118,8 +145,9 @@ export class CloudImageService {
         thumbnailPath: thumbnailCloudPath,
         detectedDorsals,
         faces: detectedFaces,
-        processed: detectedDorsals.length > 0 || detectedFaces.length > 0,
-        processingStatus: detectedDorsals.length > 0 ? 'completed' : 'pending',
+        processed,
+        processingStatus,
+        processedAt,
       });
       
       // 6. Organizar por participante si hay dorsales detectados
@@ -137,6 +165,8 @@ export class CloudImageService {
         originalUrl,
         webUrl,
         thumbnailUrl,
+        ocrSucceeded,
+        facesSucceeded,
       };
       
     } catch (error) {

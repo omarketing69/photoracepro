@@ -139,19 +139,23 @@ export class BulkUploadOptimizer {
             console.log(`   ☁️ [${photoIndex}/${photosToProcess}] Procesando: ${photo.originalname}`);
             
             const result = await this.cloudImageService.processAndUploadPhoto(eventId, photo);
-            
-            // 🔧 CRÍTICO: Agregar a procesamiento asíncrono automáticamente (especial para HEIC)
-            if (result.photoId) {
+
+            // Solo se encola un reproceso asíncrono si el intento síncrono falló
+            // de verdad (OCR o caras). Si ya tuvo éxito, encolar de nuevo solo
+            // duplicaría la llamada a Google Vision sin necesidad — el propio
+            // async-photo-processor sigue siendo la red de seguridad para HEIC
+            // u otros casos donde el intento síncrono no pudo completarse.
+            if (result.photoId && (!result.ocrSucceeded || !result.facesSucceeded)) {
               try {
                 const { asyncPhotoProcessor } = await import('./async-photo-processor');
                 const jobId = asyncPhotoProcessor.addJob(
-                  result.photoId, 
-                  eventId, 
-                  photo.originalname, 
-                  result.originalUrl || '', 
+                  result.photoId,
+                  eventId,
+                  photo.originalname,
+                  result.originalUrl || '',
                   'medium'
                 );
-                console.log(`   🔄 Agregado a procesamiento asíncrono: ${photo.originalname} (job: ${jobId})`);
+                console.log(`   🔄 Agregado a procesamiento asíncrono (reintento tras fallo síncrono): ${photo.originalname} (job: ${jobId})`);
               } catch (asyncError) {
                 console.warn(`   ⚠️ No se pudo agregar a procesamiento asíncrono: ${photo.originalname}`, asyncError);
                 // No fallar la subida por esto

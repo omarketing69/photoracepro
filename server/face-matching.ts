@@ -93,9 +93,10 @@ export async function searchByFace(
   const isRelaxed = options.relaxed === true;
   // Umbrales calibrados para landmarks normalizados (no embeddings profundos).
   // Las fotos de carrera suelen tener ángulos laterales, sombras y motion blur,
-  // lo que reduce la similitud coseno frente a una selfie frontal.
-  const SIMILARITY_THRESHOLD = isRelaxed ? 0.45 : 0.55;
-  const minExpected = isRelaxed ? 0.30 : 0.40;
+  // lo que reduce la similitud coseno frente a una selfie frontal. Priorizan
+  // evitar falsos positivos (mostrar la foto de otro corredor) sobre recall.
+  const SIMILARITY_THRESHOLD = isRelaxed ? 0.55 : 0.70;
+  const minExpected = isRelaxed ? 0.40 : 0.55;
 
   const photosWithFaces = await db
     .select({

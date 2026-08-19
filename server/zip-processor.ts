@@ -4,7 +4,6 @@ import yauzl from 'yauzl';
 import { createReadStream, createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import { storage } from './storage';
-import { GoogleVisionOCRProcessor } from './google-vision-ocr';
 
 interface ZipProcessingBatch {
   id: string;
@@ -263,53 +262,6 @@ export class ZipProcessor {
 
   getBatchStatus(batchId: string): ZipProcessingBatch | null {
     return activeBatches.get(batchId) || null;
-  }
-
-  private async processPhotoWithOCR(photoId: number, imagePath: string) {
-    try {
-      // Importar el OCR simple mejorado
-      const { processImageWithSimpleOCR } = await import('./ocr-simple');
-
-      console.log(`ZIP: Starting simple OCR processing for photo ${photoId}: ${imagePath}`);
-
-      // Procesar con OCR simple mejorado
-      const ocrResult = await processImageWithSimpleOCR(imagePath);
-
-      // Detección facial REAL con Google Vision (mismo pipeline que el upload masivo).
-      // Antes se simulaba con Math.random() — eso rompía la búsqueda por selfie porque
-      // los `faces` no tenían `landmarkVector` y se descartaban en la comparación.
-      let faces: Awaited<ReturnType<GoogleVisionOCRProcessor['detectFacesFromBuffer']>> = [];
-      try {
-        const fsSync = await import('fs');
-        const buffer = fsSync.existsSync(imagePath) ? fsSync.readFileSync(imagePath) : null;
-        if (buffer && buffer.length > 0) {
-          const { getCloudStorage } = await import('./cloud-storage');
-          const visionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
-          faces = await visionProcessor.detectFacesFromBuffer(buffer);
-          console.log(`ZIP: ${faces.length} face(s) detected for photo ${photoId}`);
-        }
-      } catch (faceErr) {
-        console.warn(`ZIP: No se pudieron detectar caras para photo ${photoId}:`, faceErr);
-        // Nunca escribir datos falsos: dejamos faces = []
-      }
-
-      // Actualizar la foto con los resultados del procesamiento
-      await storage.updatePhoto(photoId, {
-        detectedDorsals: ocrResult.dorsalNumbers,
-        faces,
-      });
-
-      console.log(`ZIP: Real OCR processed photo ${photoId}: found dorsals ${ocrResult.dorsalNumbers.join(', ')} (confidence: ${ocrResult.confidence.toFixed(2)})`);
-    } catch (error) {
-      console.error('ZIP: Error processing photo with real OCR:', error);
-
-      // On OCR failure: save empty arrays — never write fake/random data
-      await storage.updatePhoto(photoId, {
-        detectedDorsals: [],
-        faces: [],
-        processingStatus: 'failed',
-      });
-    }
   }
 
   cleanupOldBatches() {

@@ -11,7 +11,8 @@ import fs from "fs";
 import bcrypt from 'bcrypt';
 import { registerGoogleDriveRoutes } from './google-drive';
 import { googleVisionBatchProcessor } from './google-vision-processor';
-import { createGoogleVisionProcessor } from './google-vision-ocr';
+import { createGoogleVisionProcessor, DEFAULT_MAX_DORSAL } from './google-vision-ocr';
+import { derivePhotoProcessingState, photoProcessingLock } from './photo-processing-state';
 import { registerGoogleDrivePhotosRoutes } from './google-drive-photos';
 import { bulkUpload, manualUploadProcessor } from './manual-upload';
 import { registerCloudRoutes } from './cloud-routes';
@@ -122,59 +123,79 @@ const upload = multer({
   },
 });
 
-// Función para procesar foto con OCR + detección facial real (Google Vision)
-async function processPhotoWithOCR(photoId: number, imagePath: string) {
+// Función para procesar foto con OCR + detección facial real (Google Vision, motor único)
+async function processPhotoWithOCR(photoId: number, imagePath: string, eventId: number) {
+  if (!photoProcessingLock.tryAcquire(photoId)) {
+    console.log(`⏭️ Foto ${photoId} ya se está procesando (cola u otro reproceso), se omite duplicado`);
+    return;
+  }
   try {
-    const { processImageWithSimpleOCR } = await import('./ocr-simple');
-    const { createGoogleVisionProcessor } = await import('./google-vision-ocr');
     const { getCloudStorage: getLegacyCloudStorage } = await import('./cloud-storage');
 
     console.log(`Starting OCR + face detection for photo ${photoId}: ${imagePath}`);
 
-    // Run OCR
-    const ocrResult = await processImageWithSimpleOCR(imagePath);
+    const cloudStorage = getLegacyCloudStorage();
+    const visionProcessor = createGoogleVisionProcessor(cloudStorage);
 
-    // Run real Vision face detection by downloading the image buffer from GCS
-    let faces: Awaited<ReturnType<ReturnType<typeof createGoogleVisionProcessor>['detectFacesFromBuffer']>> = [];
-    try {
-      const cloudStorage = getLegacyCloudStorage();
-      const visionProcessor = createGoogleVisionProcessor(cloudStorage);
+    const event = await storage.getEvent(eventId);
+    const maxDorsal = event?.maxDorsalNumber ?? DEFAULT_MAX_DORSAL;
 
-      // Extract the GCS object name from the path
-      const bucketName = process.env.GCS_BUCKET_NAME || 'race-photos-storage';
-      let objectName = imagePath;
-      if (imagePath.startsWith(`gs://${bucketName}/`)) {
-        objectName = imagePath.slice(`gs://${bucketName}/`.length);
-      } else if (imagePath.startsWith('https://storage.googleapis.com/')) {
-        const url = new URL(imagePath);
-        objectName = url.pathname.replace(`/${bucketName}/`, '');
-      }
-
-      const imageBuffer = await cloudStorage.downloadFile(objectName);
-      faces = await visionProcessor.detectFacesFromBuffer(imageBuffer);
-      console.log(`✅ [FACE] Photo ${photoId}: ${faces.length} face(s) detected`);
-    } catch (faceErr) {
-      console.warn(`⚠️ [FACE] Could not detect faces for photo ${photoId}:`, faceErr);
-      // Leave faces as empty array — never write fake data
+    // Extract the GCS object name from the path
+    const bucketName = process.env.GCS_BUCKET_NAME || 'race-photos-storage';
+    let objectName = imagePath;
+    if (imagePath.startsWith(`gs://${bucketName}/`)) {
+      objectName = imagePath.slice(`gs://${bucketName}/`.length);
+    } else if (imagePath.startsWith('https://storage.googleapis.com/')) {
+      const url = new URL(imagePath);
+      objectName = url.pathname.replace(`/${bucketName}/`, '');
     }
+
+    const imageBuffer = await cloudStorage.downloadFile(objectName);
+
+    const [ocrResult, faceResult] = await Promise.all([
+      visionProcessor.processImageBuffer(imageBuffer, maxDorsal),
+      visionProcessor.detectFacesFromBufferWithStatus(imageBuffer),
+    ]);
+
+    console.log(`✅ [FACE] Photo ${photoId}: ${faceResult.faces.length} face(s) detected (success=${faceResult.success})`);
+
+    const state = derivePhotoProcessingState({
+      ocrAttempted: true,
+      ocrSucceeded: ocrResult.success,
+      facesAttempted: true,
+      facesSucceeded: faceResult.success,
+    });
 
     await storage.updatePhoto(photoId, {
       detectedDorsals: ocrResult.dorsalNumbers,
-      faces,
+      faces: faceResult.faces,
+      processed: state.processed,
+      processingStatus: state.processingStatus,
+      processedAt: state.processedAt,
     });
 
-    console.log(`OCR processed photo ${photoId}: dorsals [${ocrResult.dorsalNumbers.join(', ')}] confidence ${ocrResult.confidence.toFixed(2)}`);
+    console.log(`OCR processed photo ${photoId}: dorsals [${ocrResult.dorsalNumbers.join(', ')}] status=${state.processingStatus}`);
   } catch (error) {
     console.error('Error processing photo with OCR:', error);
 
     // On OCR failure: save empty arrays — never write fake/random data
+    const state = derivePhotoProcessingState({
+      ocrAttempted: true,
+      ocrSucceeded: false,
+      facesAttempted: true,
+      facesSucceeded: false,
+    });
     await storage.updatePhoto(photoId, {
       detectedDorsals: [],
       faces: [],
-      processingStatus: 'failed',
+      processed: state.processed,
+      processingStatus: state.processingStatus,
+      processedAt: state.processedAt,
     });
 
-    console.log(`OCR failed for photo ${photoId}: saved empty dorsals, status=failed`);
+    console.log(`OCR failed for photo ${photoId}: saved empty dorsals, status=${state.processingStatus}`);
+  } finally {
+    photoProcessingLock.release(photoId);
   }
 }
 
@@ -1342,7 +1363,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       for (const photo of photos) {
         if (photo.detectedDorsals?.length === 0 || !photo.detectedDorsals) {
           // Solo procesar fotos que aún no tienen dorsales detectados
-          setTimeout(() => processPhotoWithOCR(photo.id, photo.originalPath), 500 * processedCount);
+          setTimeout(() => processPhotoWithOCR(photo.id, photo.originalPath, eventId), 500 * processedCount);
           processedCount++;
         }
       }
@@ -1367,7 +1388,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Procesar todas las fotos con OCR real, incluso las que ya tienen dorsales
       photos.forEach((photo, index) => {
-        setTimeout(() => processPhotoWithOCR(photo.id, photo.originalPath), 1000 * index);
+        setTimeout(() => processPhotoWithOCR(photo.id, photo.originalPath, eventId), 1000 * index);
       });
 
       res.json({
@@ -1520,201 +1541,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return res.status(404).json({ error: 'No hay trabajo de re-detección facial para este evento' });
     }
     res.json(job);
-  });
-
-  // Función auxiliar para procesar con OCR mejorado
-  async function processPhotoWithEnhancedOCR(photoId: number, gcsImagePath: string) {
-    let tempFilePath: string | null = null;
-    
-    try {
-      console.log(`🔍 Starting enhanced OCR for photo ${photoId}: ${gcsImagePath}`);
-      
-      // 1. Descargar foto temporalmente desde Google Cloud Storage
-      const { Storage } = await import('@google-cloud/storage');
-      const storage_client = new Storage({
-        projectId: 'REDACTED_GCS_PROJECT',
-        keyFilename: './google-credentials.json'
-      });
-      const bucket = storage_client.bucket('REDACTED_GCS_BUCKET');
-      
-      // Crear archivo temporal
-      const fs = await import('fs');
-      const path = await import('path');
-      const filename = path.basename(gcsImagePath);
-      tempFilePath = `/tmp/ocr-${Date.now()}-${filename}`;
-      
-      console.log(`📥 Downloading from GCS: ${gcsImagePath} → ${tempFilePath}`);
-      const [exists] = await bucket.file(gcsImagePath).exists();
-      if (!exists) {
-        console.log(`❌ File not found in GCS: ${gcsImagePath}`);
-        return;
-      }
-      
-      // Descargar archivo
-      await bucket.file(gcsImagePath).download({ destination: tempFilePath });
-      console.log(`✅ Downloaded successfully to temp file`);
-      
-      // 2. Aplicar OCR mejorado al archivo temporal con unified credentials
-      const { createGoogleVisionProcessor } = await import('./google-vision-ocr');
-      const { getCloudStorage } = await import('./cloud-storage');
-      const cloudStorage = getCloudStorage();
-      const googleVisionProcessor = createGoogleVisionProcessor(cloudStorage);
-      const ocrResult = await googleVisionProcessor.processImage(tempFilePath);
-      
-      // 3. Simular detección de caras (mantener consistente)
-      const faces = [{
-        x: Math.floor(Math.random() * 200),
-        y: Math.floor(Math.random() * 200), 
-        width: 100 + Math.floor(Math.random() * 50),
-        height: 100 + Math.floor(Math.random() * 50),
-        confidence: 0.8 + Math.random() * 0.2
-      }];
-
-      // 4. Actualizar la foto con los resultados del procesamiento
-      await storage.updatePhoto(photoId, {
-        detectedDorsals: ocrResult.dorsalNumbers,
-        faces: faces,
-        processed: true,
-        processingStatus: ocrResult.dorsalNumbers.length > 0 ? 'completed' : 'no_dorsals_found'
-      });
-
-      console.log(`✅ Enhanced OCR completed for photo ${photoId}:`);
-      console.log(`   📊 Found ${ocrResult.dorsalNumbers.length} dorsals: [${ocrResult.dorsalNumbers.join(', ')}]`);
-      console.log(`   🎯 Confidence: ${(ocrResult.confidence).toFixed(1)}%`);
-      
-    } catch (error) {
-      console.error(`❌ Error processing photo ${photoId} with enhanced OCR:`, error);
-      console.log(`Enhanced OCR failed for photo ${photoId}, keeping original data`);
-    } finally {
-      // 5. Limpiar archivo temporal
-      if (tempFilePath) {
-        try {
-          const fs = await import('fs');
-          if (fs.existsSync(tempFilePath)) {
-            fs.unlinkSync(tempFilePath);
-            console.log(`🧹 Temp file cleaned: ${tempFilePath}`);
-          }
-        } catch (cleanupError) {
-          console.warn(`⚠️ Could not clean temp file: ${tempFilePath}`);
-        }
-      }
-    }
-  }
-
-  // Endpoint para reprocesar todas las fotos con OCR mejorado
-  app.post("/api/events/:id/reprocess-enhanced", requireAdmin, async (req, res) => {
-    try {
-      const eventId = parseInt(req.params.id);
-      const photos = await storage.getPhotos(eventId);
-      
-      // Procesar todas las fotos con OCR mejorado
-      photos.forEach((photo, index) => {
-        setTimeout(() => processPhotoWithEnhancedOCR(photo.id, photo.originalPath), 2000 * index);
-      });
-
-      res.json({
-        success: true,
-        message: `Reprocesando todas las ${photos.length} fotos con OCR mejorado`,
-        photosToProcess: photos.length,
-        estimatedTime: `${Math.ceil(photos.length * 2)} minutos aproximadamente`
-      });
-
-    } catch (error) {
-      console.error("Error reprocessing all photos with enhanced OCR:", error);
-      res.status(500).json({ message: "Failed to reprocess all photos with enhanced OCR" });
-    }
-  });
-
-  // Función auxiliar para procesar con Super OCR
-  async function processPhotoWithSuperOCR(photoId: number, imagePath: string) {
-    try {
-      console.log(`Starting SUPER OCR processing for photo ${photoId}: ${imagePath}`);
-      
-      const { processImageWithSuperOCR } = await import('./ocr-super');
-      const ocrResult = await processImageWithSuperOCR(imagePath);
-      
-      // Simular detección de caras (mantener consistente)
-      const faces = [{
-        x: Math.floor(Math.random() * 200),
-        y: Math.floor(Math.random() * 200), 
-        width: 100 + Math.floor(Math.random() * 50),
-        height: 100 + Math.floor(Math.random() * 50),
-        confidence: 0.8 + Math.random() * 0.2
-      }];
-
-      // Actualizar la foto con los resultados del procesamiento
-      await storage.updatePhoto(photoId, {
-        detectedDorsals: ocrResult.dorsalNumbers,
-        faces: faces
-      });
-
-      console.log(`SUPER OCR processed photo ${photoId}: found ${ocrResult.dorsalNumbers.length} dorsals: ${ocrResult.dorsalNumbers.join(', ')}`);
-      console.log(`SUPER OCR confidence: ${(ocrResult.confidence * 100).toFixed(1)}%`);
-      console.log(`SUPER OCR details: ${ocrResult.details.slice(0, 3).join(' | ')}`);
-    } catch (error) {
-      console.error(`Error processing photo ${photoId} with Super OCR:`, error);
-    }
-  }
-
-  // Endpoint para reprocesar todas las fotos con Super OCR
-  app.post("/api/events/:id/reprocess-super", requireAdmin, async (req, res) => {
-    try {
-      const eventId = parseInt(req.params.id);
-      const photos = await storage.getPhotos(eventId);
-      
-      // Procesar todas las fotos con Super OCR
-      photos.forEach((photo, index) => {
-        setTimeout(() => processPhotoWithSuperOCR(photo.id, photo.originalPath), 3000 * index);
-      });
-
-      res.json({
-        success: true,
-        message: `Reprocesando todas las ${photos.length} fotos con SUPER OCR`,
-        photosToProcess: photos.length,
-        estimatedTime: `${Math.ceil(photos.length * 3)} minutos aproximadamente`,
-        note: "Super OCR usa 8 versiones de preprocesamiento por foto para máxima precisión"
-      });
-
-    } catch (error) {
-      console.error("Error reprocessing all photos with Super OCR:", error);
-      res.status(500).json({ message: "Failed to reprocess all photos with Super OCR" });
-    }
-  });
-
-  // Endpoint para probar OCR en una foto específica con logs detallados
-  app.post("/api/photos/:id/test-ocr", async (req, res) => {
-    try {
-      const photoId = parseInt(req.params.id);
-      const photo = await storage.getPhoto(photoId);
-      
-      if (!photo) {
-        return res.status(404).json({ message: "Photo not found" });
-      }
-
-      console.log(`Testing OCR on photo ${photoId}: ${photo.originalPath}`);
-      
-      // Procesar con OCR real y logs detallados
-      const { processImageWithRealOCR } = await import('./ocr-real');
-      const ocrResult = await processImageWithRealOCR(photo.originalPath);
-      
-      res.json({
-        success: true,
-        photo: {
-          id: photo.id,
-          filename: photo.filename,
-          originalPath: photo.originalPath
-        },
-        ocrResult: {
-          dorsalNumbers: ocrResult.dorsalNumbers,
-          confidence: ocrResult.confidence,
-          rawText: ocrResult.text
-        }
-      });
-
-    } catch (error) {
-      console.error("Error testing OCR:", error);
-      res.status(500).json({ message: "Failed to test OCR" });
-    }
   });
 
   // ENDPOINT DESHABILITADO PARA EVITAR COSTOS DUPLICADOS
@@ -2764,35 +2590,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.status(500).json({ 
         error: 'Failed to get batch status' 
       });
-    }
-  });
-
-  // Debug OCR de una foto específica
-  app.post('/api/photos/:photoId/debug-ocr', async (req, res) => {
-    try {
-      const photoId = parseInt(req.params.photoId);
-      const photo = await storage.getPhoto(photoId);
-      
-      if (!photo) {
-        return res.status(404).json({ error: 'Foto no encontrada' });
-      }
-
-      // Importar el OCR simple
-      const { processImageWithSimpleOCR } = await import('./ocr-simple');
-      
-      console.log(`DEBUG OCR for photo ${photoId}: ${photo.originalPath}`);
-      const ocrResult = await processImageWithSimpleOCR(photo.originalPath);
-      
-      res.json({
-        photoId,
-        filename: photo.filename,
-        originalPath: photo.originalPath,
-        ocrResult,
-        currentDorsals: photo.detectedDorsals
-      });
-    } catch (error) {
-      console.error('Error debugging OCR:', error);
-      res.status(500).json({ error: 'Error al depurar OCR' });
     }
   });
 
@@ -3889,71 +3686,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error('Error generating thumbnail:', error);
       res.status(500).json({ error: 'Failed to generate thumbnail' });
-    }
-  });
-
-  // Endpoint para buscar dorsales específicos con procesamiento inmediato
-  app.post('/api/find-dorsal/:dorsalNumber', async (req, res) => {
-    try {
-      const dorsalNumber = parseInt(req.params.dorsalNumber);
-      
-      // Primero buscar si ya existe
-      const existingPhotos = await storage.searchPhotosByDorsal(1, dorsalNumber);
-      if (existingPhotos.photos && existingPhotos.photos.length > 0) {
-        return res.json({
-          found: true,
-          dorsal: dorsalNumber,
-          photos: existingPhotos.photos.slice(0, 3),
-          message: `Dorsal ${dorsalNumber} ya detectado en ${existingPhotos.photos.length} fotos`
-        });
-      }
-      
-      // Si no existe, procesar todas las fotos con técnicas agresivas
-      const photos = await storage.getPhotos(1);
-      let foundInPhotos = [];
-      
-      for (const photo of photos.slice(0, 5)) { // Procesar las primeras 5 fotos
-        try {
-          const { enhancedOCRProcessor } = await import('./ocr-enhanced');
-          await enhancedOCRProcessor.initialize();
-          
-          const result = await enhancedOCRProcessor.processImage(photo.originalPath);
-          
-          if (result.dorsalNumbers.includes(dorsalNumber)) {
-            // Actualizar base de datos
-            const existingDorsals = photo.detectedDorsals || [];
-            const newDorsals = Array.from(new Set([...existingDorsals, ...result.dorsalNumbers]));
-            
-            await storage.updatePhoto(photo.id, {
-              detectedDorsals: newDorsals,
-              processed: true,
-              processingStatus: 'completed'
-            });
-            
-            foundInPhotos.push({
-              ...photo,
-              detectedDorsals: newDorsals
-            });
-          }
-          
-          await enhancedOCRProcessor.terminate();
-        } catch (error) {
-          console.error(`Error processing photo ${photo.id}:`, error);
-        }
-      }
-      
-      res.json({
-        found: foundInPhotos.length > 0,
-        dorsal: dorsalNumber,
-        photos: foundInPhotos,
-        message: foundInPhotos.length > 0 ? 
-          `Dorsal ${dorsalNumber} encontrado en ${foundInPhotos.length} fotos` :
-          `Dorsal ${dorsalNumber} no encontrado en las fotos procesadas`
-      });
-      
-    } catch (error) {
-      console.error('Error finding dorsal:', error);
-      res.status(500).json({ error: 'Error buscando dorsal específico' });
     }
   });
 

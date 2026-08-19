@@ -46,7 +46,7 @@ export async function reprocessEvent8WithNewOCR(): Promise<{ success: boolean; m
     
     // Initialize Google Cloud Storage and OCR processor
     const cloudStorage = getCloudStorage();
-    const ocrProcessor = new GoogleVisionOCRProcessor();
+    const ocrProcessor = new GoogleVisionOCRProcessor(cloudStorage);
     
     // Get all photos from Event 8
     console.log(`🔍 [OCR REPROCESS] Getting all photos for Event 8...`);
