@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { storage } from './storage';
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { getCloudStorage } from './cloud-storage';
 import { imageService } from './image-service';
 
 interface DriveFile {
@@ -194,7 +195,7 @@ export class GoogleDrivePhotosManager {
           const photoRecord = await storage.createPhoto(photoData);
 
           // Process with Google Vision OCR
-          const googleVisionProcessor = new GoogleVisionOCRProcessor();
+          const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
           const ocrResult = await googleVisionProcessor.processImage(destinationPath);
 
           if (ocrResult.dorsalNumbers.length > 0) {

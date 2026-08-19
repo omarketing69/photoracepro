@@ -4,6 +4,7 @@ import { db } from './db';
 import { photos } from '../shared/schema';
 import { eq } from 'drizzle-orm';
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { getCloudStorage } from './cloud-storage';
 
 export async function processExistingPhotos(eventId: number) {
   console.log(`🔄 Iniciando procesamiento de fotos existentes para evento ${eventId}`);
@@ -17,7 +18,7 @@ export async function processExistingPhotos(eventId: number) {
     
     console.log(`📸 Encontradas ${unprocessedPhotos.length} fotos para procesar`);
     
-    const googleVisionProcessor = new GoogleVisionOCRProcessor();
+    const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
     let processedCount = 0;
     let failedCount = 0;
     

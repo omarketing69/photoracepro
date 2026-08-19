@@ -1,4 +1,5 @@
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { getCloudStorage } from './cloud-storage';
 import { Storage } from '@google-cloud/storage';
 import { storage } from './storage';
 import path from 'path';
@@ -34,7 +35,7 @@ export async function simpleSyncEvent5() {
 
     console.log(`📊 ${photoFiles.length} fotos encontradas`);
 
-    const googleVisionProcessor = new GoogleVisionOCRProcessor();
+    const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
 
     for (let i = 0; i < Math.min(photoFiles.length, 20); i++) {
       const file = photoFiles[i];

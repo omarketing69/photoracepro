@@ -8,7 +8,7 @@ import { GoogleVisionOCRProcessor } from './google-vision-ocr';
 export async function syncCloudPhotos() {
   const cloudStorage = getCloudStorage();
   const bucket = cloudStorage.storage.bucket('REDACTED_GCS_BUCKET');
-  const ocrProcessor = new GoogleVisionOCRProcessor();
+  const ocrProcessor = new GoogleVisionOCRProcessor(cloudStorage);
   
   console.log('Synchronizing photos from Google Cloud Storage...');
   

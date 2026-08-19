@@ -1,4 +1,5 @@
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { getCloudStorage } from './cloud-storage';
 import { storage } from './storage';
 import { imageService } from './image-service';
 import { canonicalEventId } from './utils/canonical-event-id';
@@ -60,7 +61,7 @@ export class GoogleVisionBatchProcessor {
           
           // Process with Google Vision (supports both local and GCS)
           // Removed fs.existsSync guard to enable GCS OCR fallback
-          const googleVisionProcessor = new GoogleVisionOCRProcessor();
+          const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
           const result = await googleVisionProcessor.processImage(photo.originalPath);
           
           if (result.dorsalNumbers.length > 0) {
@@ -147,7 +148,7 @@ export class GoogleVisionBatchProcessor {
 
         console.log(`\n📸 Procesando foto ${photoId}: ${photo.filename}`);
 
-        const googleVisionProcessor = new GoogleVisionOCRProcessor();
+        const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
         const result = await googleVisionProcessor.processImage(photo.originalPath);
         
         if (result.dorsalNumbers.length > 0) {
@@ -198,9 +199,9 @@ export class GoogleVisionBatchProcessor {
           continue;
         }
 
-        const googleVisionProcessor = new GoogleVisionOCRProcessor();
+        const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
         const result = await googleVisionProcessor.processImage(photo.originalPath);
-        
+
         // Check if any missing dorsals were found
         const foundInThisPhoto = missingDorsals.filter(dorsal => 
           result.dorsalNumbers.includes(dorsal)

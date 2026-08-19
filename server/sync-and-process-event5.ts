@@ -42,7 +42,8 @@ export async function syncAndProcessEvent5() {
     }
 
     // 2. Inicializar OCR mejorado
-    const googleVisionProcessor = new GoogleVisionOCRProcessor();
+    const cloudStorage = getCloudStorage();
+    const googleVisionProcessor = new GoogleVisionOCRProcessor(cloudStorage);
     console.log('✅ OCR mejorado inicializado (filtros relajados)');
 
     // 3. Procesar cada foto

@@ -1,4 +1,5 @@
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { getCloudStorage } from './cloud-storage';
 import { Storage } from '@google-cloud/storage';
 import path from 'path';
 import fs from 'fs';
@@ -32,7 +33,7 @@ export async function massReprocessEvent5() {
 
     console.log(`📊 ${photoFiles.length} fotos para reprocesar`);
 
-    const googleVisionProcessor = new GoogleVisionOCRProcessor();
+    const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
 
     // Procesar en lotes
     for (let i = 0; i < Math.min(photoFiles.length, 200); i++) {
