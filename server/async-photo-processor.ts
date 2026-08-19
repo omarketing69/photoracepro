@@ -3,7 +3,8 @@ import { EventEmitter } from 'events';
 import { performanceMonitor } from './performance-monitor';
 import { thumbnailCache } from './thumbnail-cache';
 import { getCloudStorage } from './cloud-storage';
-import { GoogleVisionOCRProcessor, type FaceAnnotation } from './google-vision-ocr';
+import { GoogleVisionOCRProcessor, DEFAULT_MAX_DORSAL, type FaceAnnotation } from './google-vision-ocr';
+import { derivePhotoProcessingState, photoProcessingLock } from './photo-processing-state';
 
 interface ProcessingJob {
   id: string;
@@ -59,8 +60,15 @@ class AsyncPhotoProcessor extends EventEmitter {
    * Agregar trabajo de procesamiento a la cola
    */
   addJob(photoId: number, eventId: number, filename: string, originalPath: string, priority: 'high' | 'medium' | 'low' = 'medium'): string {
+    // Evitar encolar la misma foto dos veces (ya en cola o ya procesándose):
+    // duplicaría el gasto de Google Vision y crearía una carrera "último en escribir gana".
+    if (photoProcessingLock.isLocked(photoId) || this.processingQueue.some(job => job.photoId === photoId)) {
+      console.log(`⏭️ Foto ${photoId} ya está en cola o procesándose, se omite duplicado`);
+      return `skipped_duplicate_${photoId}`;
+    }
+
     const jobId = `job_${photoId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+
     const job: ProcessingJob = {
       id: jobId,
       photoId,
@@ -196,29 +204,48 @@ class AsyncPhotoProcessor extends EventEmitter {
     console.log(`🔄 Procesando foto ${job.photoId} (intento ${job.retries + 1})`);
     this.emit('jobStarted', job);
 
+    if (!photoProcessingLock.tryAcquire(job.photoId)) {
+      console.log(`⏭️ Foto ${job.photoId} ya está siendo procesada por otro job, se reencola sin reintentar`);
+      this.processingJobs.delete(job.id);
+      this.processingQueue.push(job);
+      return;
+    }
+
     try {
       // Obtener foto desde Google Cloud Storage
       const signedUrl = await this.cloudStorage.generateSignedUrl(job.originalPath, 60);
       const response = await fetch(signedUrl);
-      
+
       if (!response.ok) {
         throw new Error(`No se pudo obtener la foto desde GCS: ${response.status}`);
       }
 
       const imageBuffer = Buffer.from(await response.arrayBuffer());
-      
+
+      // Resolver el techo de dorsal del evento (default de la plataforma si no está configurado)
+      const { storage } = await import('./storage');
+      const event = await storage.getEvent(job.eventId);
+      const maxDorsal = event?.maxDorsalNumber ?? DEFAULT_MAX_DORSAL;
+
       // Procesar OCR y detección facial en paralelo
       const ocrStartTime = Date.now();
-      const [ocrResult, detectedFaces] = await Promise.all([
-        this.ocrProcessor.processImageBuffer(imageBuffer),
-        this.ocrProcessor.detectFacesFromBuffer(imageBuffer).catch(() => [] as FaceAnnotation[])
+      const [ocrResult, faceResult] = await Promise.all([
+        this.ocrProcessor.processImageBuffer(imageBuffer, maxDorsal),
+        this.ocrProcessor.detectFacesFromBufferWithStatus(imageBuffer)
       ]);
       const ocrTime = Date.now() - ocrStartTime;
 
       // ocrResult is GoogleVisionResult { dorsalNumbers: number[] }
       const detectedDorsals: number[] = ocrResult.dorsalNumbers;
+      const detectedFaces: FaceAnnotation[] = faceResult.faces;
 
-      console.log(`👤 [FACE] Photo ${job.photoId}: detected ${detectedFaces.length} face(s)`);
+      if (!ocrResult.success && !faceResult.success) {
+        // Ambas llamadas a Vision fallaron de verdad (no "0 resultados") — dispara
+        // el mecanismo de reintentos en vez de guardar la foto como "completada" sin datos.
+        throw new Error('Google Vision OCR y detección facial fallaron para esta foto');
+      }
+
+      console.log(`👤 [FACE] Photo ${job.photoId}: detected ${detectedFaces.length} face(s) (success=${faceResult.success})`);
 
       // Generar thumbnail y cachear
       const thumbnailStartTime = Date.now();
@@ -226,11 +253,11 @@ class AsyncPhotoProcessor extends EventEmitter {
       const thumbnailTime = Date.now() - thumbnailStartTime;
 
       // Actualizar base de datos con dorsales Y caras
-      await this.updatePhotoInDatabase(job.photoId, detectedDorsals, detectedFaces);
+      await this.updatePhotoInDatabase(job.photoId, detectedDorsals, detectedFaces, ocrResult.success, faceResult.success);
 
       job.completedAt = new Date();
       const totalTime = performanceMonitor.endOperation(operationId);
-      
+
       // Mover a completados
       this.processingJobs.delete(job.id);
       this.completedJobs.push(job);
@@ -251,7 +278,7 @@ class AsyncPhotoProcessor extends EventEmitter {
       });
 
       console.log(`✅ Foto ${job.photoId} procesada exitosamente (${detectedDorsals.length} dorsales, ${totalTime.toFixed(1)}ms)`);
-      
+
       const result: ProcessingResult = {
         photoId: job.photoId,
         success: true,
@@ -285,6 +312,25 @@ class AsyncPhotoProcessor extends EventEmitter {
         if (this.failedJobs.length > 100) {
           this.failedJobs.shift();
         }
+
+        // Marcar la foto como 'failed' en BD (no dejarla en 'pending' para
+        // siempre, indistinguible de una foto que nunca se intentó procesar).
+        try {
+          const { storage } = await import('./storage');
+          const state = derivePhotoProcessingState({
+            ocrAttempted: true,
+            ocrSucceeded: false,
+            facesAttempted: true,
+            facesSucceeded: false,
+          });
+          await storage.updatePhoto(job.photoId, {
+            processed: state.processed,
+            processingStatus: state.processingStatus,
+            processedAt: state.processedAt,
+          });
+        } catch (updateError) {
+          console.error(`❌ No se pudo marcar la foto ${job.photoId} como fallida en BD:`, updateError);
+        }
       }
 
       // Registrar métricas de error
@@ -306,24 +352,40 @@ class AsyncPhotoProcessor extends EventEmitter {
       };
 
       this.emit('jobFailed', job, result);
+    } finally {
+      photoProcessingLock.release(job.photoId);
     }
   }
 
   /**
    * Actualizar foto en base de datos con dorsales y datos faciales
    */
-  private async updatePhotoInDatabase(photoId: number, detectedDorsals: number[], faces: FaceAnnotation[] = []): Promise<void> {
+  private async updatePhotoInDatabase(
+    photoId: number,
+    detectedDorsals: number[],
+    faces: FaceAnnotation[] = [],
+    ocrSucceeded: boolean = true,
+    facesSucceeded: boolean = true
+  ): Promise<void> {
     try {
       const { storage } = await import('./storage');
-      
+
+      const { processed, processingStatus, processedAt } = derivePhotoProcessingState({
+        ocrAttempted: true,
+        ocrSucceeded,
+        facesAttempted: true,
+        facesSucceeded,
+      });
+
       await storage.updatePhoto(photoId, {
         detectedDorsals,
         faces,
-        processed: true,
-        processingStatus: 'completed'
+        processed,
+        processingStatus,
+        processedAt,
       });
-      
-      console.log(`📝 Foto ${photoId} actualizada con ${detectedDorsals.length} dorsales y ${faces.length} caras`);
+
+      console.log(`📝 Foto ${photoId} actualizada con ${detectedDorsals.length} dorsales y ${faces.length} caras (status=${processingStatus})`);
     } catch (error) {
       console.error(`❌ Error actualizando foto ${photoId}:`, error);
       throw error;

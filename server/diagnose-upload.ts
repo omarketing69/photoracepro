@@ -49,7 +49,7 @@ export async function diagnoseUploadSystem() {
   // 3. Verificar Google Vision OCR
   try {
     console.log('🔍 Verificando Google Vision OCR...');
-    const ocrProcessor = new GoogleVisionOCRProcessor();
+    const ocrProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
     
     // Crear archivo temporal de prueba
     const fs = await import('fs');

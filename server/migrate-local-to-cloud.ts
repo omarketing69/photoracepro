@@ -6,7 +6,7 @@ import sharp from 'sharp';
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
 
 const cloudStorage = getCloudStorage();
-const ocrProcessor = new GoogleVisionOCRProcessor();
+const ocrProcessor = new GoogleVisionOCRProcessor(cloudStorage);
 
 export async function migrateLocalPhotosToCloud(eventId: number = 1): Promise<{
   migrated: number;

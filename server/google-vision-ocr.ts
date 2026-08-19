@@ -12,7 +12,14 @@ interface GoogleVisionResult {
     confidence: number;
     boundingBox?: any;
   }>;
+  // true = Vision API call completed without error (even if 0 dorsals were found).
+  // false = the API call itself failed (quota, network, auth) after retries were exhausted.
+  success: boolean;
 }
+
+// Races on this platform default to dorsal range 1–1600. Callers can override
+// per event via `event.maxDorsalNumber` when it differs from the default.
+export const DEFAULT_MAX_DORSAL = 1600;
 
 export interface FaceAnnotation {
   x: number;
@@ -109,11 +116,11 @@ export class GoogleVisionOCRProcessor {
     }
   }
 
-  async processImage(imagePath: string): Promise<GoogleVisionResult> {
-    return this.processImageWithRetry(imagePath, 0);
+  async processImage(imagePath: string, maxDorsal: number = DEFAULT_MAX_DORSAL): Promise<GoogleVisionResult> {
+    return this.processImageWithRetry(imagePath, 0, maxDorsal);
   }
 
-  private async processImageWithRetry(imagePath: string, attempt: number): Promise<GoogleVisionResult> {
+  private async processImageWithRetry(imagePath: string, attempt: number, maxDorsal: number = DEFAULT_MAX_DORSAL): Promise<GoogleVisionResult> {
     try {
       // Rate limiting for 6,000 photos
       await this.waitForToken();
@@ -141,17 +148,17 @@ export class GoogleVisionOCRProcessor {
       }
       
       // Process results
-      const processedResult = this.processGoogleVisionResponse(result);
-      
+      const processedResult = this.processGoogleVisionResponse(result, maxDorsal);
+
       console.log(`📊 Google Vision detectó: ${processedResult.dorsalNumbers.length} dorsales`);
       console.log(`📝 Dorsales encontrados: [${processedResult.dorsalNumbers.join(', ')}]`);
       console.log(`📄 Texto completo: "${processedResult.allText.substring(0, 100)}..."`);
-      
+
       return processedResult;
-      
+
     } catch (error) {
       console.error(`❌ Error con Google Vision OCR (intento ${attempt + 1}):`, error);
-      
+
       // Handle 429 rate limit errors with exponential backoff
       if (error instanceof Error && (error.message.includes('429') || error.message.includes('RATE_LIMIT'))) {
         const maxRetries = 5;
@@ -159,16 +166,18 @@ export class GoogleVisionOCRProcessor {
           const backoffDelay = Math.min(1000 * Math.pow(2, attempt), 10000); // Max 10 seconds
           console.log(`⚠️ [RATE LIMIT] API rate limited, retrying in ${backoffDelay}ms (intento ${attempt + 1}/${maxRetries})`);
           await new Promise(resolve => setTimeout(resolve, backoffDelay));
-          return this.processImageWithRetry(imagePath, attempt + 1);
+          return this.processImageWithRetry(imagePath, attempt + 1, maxDorsal);
         }
       }
-      
-      // Return fallback result after exhausting retries
+
+      // Return fallback result after exhausting retries — success:false lets
+      // callers distinguish a real API failure from a legitimate 0-dorsal result.
       return {
         dorsalNumbers: [],
         confidence: 0,
         allText: '',
-        detectedWords: []
+        detectedWords: [],
+        success: false
       };
     }
   }
@@ -176,7 +185,7 @@ export class GoogleVisionOCRProcessor {
   /**
    * Process image directly from Buffer (required by preflight validation)
    */
-  async processImageBuffer(imageBuffer: Buffer): Promise<GoogleVisionResult> {
+  async processImageBuffer(imageBuffer: Buffer, maxDorsal: number = DEFAULT_MAX_DORSAL): Promise<GoogleVisionResult> {
     try {
       console.log(`🔍 Procesando buffer de imagen con Google Vision OCR (${imageBuffer.length} bytes)`);
       
@@ -196,23 +205,25 @@ export class GoogleVisionOCRProcessor {
       }
       
       // Process results
-      const processedResult = this.processGoogleVisionResponse(result);
-      
+      const processedResult = this.processGoogleVisionResponse(result, maxDorsal);
+
       console.log(`📊 Google Vision (buffer) detectó: ${processedResult.dorsalNumbers.length} dorsales`);
       console.log(`📝 Dorsales encontrados: [${processedResult.dorsalNumbers.join(', ')}]`);
       console.log(`📄 Texto completo: "${processedResult.allText.substring(0, 100)}..."`);
-      
+
       return processedResult;
-      
+
     } catch (error) {
       console.error('❌ Error con Google Vision OCR (buffer):', error);
-      
-      // Return fallback result
+
+      // Return fallback result — success:false lets callers distinguish a real
+      // API failure from a legitimate 0-dorsal result.
       return {
         dorsalNumbers: [],
         confidence: 0,
         allText: '',
-        detectedWords: []
+        detectedWords: [],
+        success: false
       };
     }
   }
@@ -223,6 +234,30 @@ export class GoogleVisionOCRProcessor {
    */
   async detectFacesFromBuffer(imageBuffer: Buffer): Promise<FaceAnnotation[]> {
     try {
+      return await this.detectFacesCore(imageBuffer);
+    } catch (error) {
+      console.error('❌ [FACE] Error detecting faces:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Same as detectFacesFromBuffer but also reports whether the Vision API
+   * call itself failed, so callers can distinguish "0 faces found" (success)
+   * from "the API call errored" (failure) instead of treating both the same.
+   */
+  async detectFacesFromBufferWithStatus(imageBuffer: Buffer): Promise<{ faces: FaceAnnotation[]; success: boolean }> {
+    try {
+      const faces = await this.detectFacesCore(imageBuffer);
+      return { faces, success: true };
+    } catch (error) {
+      console.error('❌ [FACE] Error detecting faces:', error);
+      return { faces: [], success: false };
+    }
+  }
+
+  private async detectFacesCore(imageBuffer: Buffer): Promise<FaceAnnotation[]> {
+    {
       console.log(`🔍 [FACE] Detecting faces in buffer (${imageBuffer.length} bytes)`);
 
       const [result] = await this.client.faceDetection({
@@ -299,10 +334,6 @@ export class GoogleVisionOCRProcessor {
 
       console.log(`✅ [FACE] Detected ${faces.length} face(s)`);
       return faces;
-
-    } catch (error) {
-      console.error('❌ [FACE] Error detecting faces:', error);
-      return [];
     }
   }
 
@@ -372,7 +403,7 @@ export class GoogleVisionOCRProcessor {
     return vector;
   }
 
-  private processGoogleVisionResponse(result: any): GoogleVisionResult {
+  private processGoogleVisionResponse(result: any, maxDorsal: number = DEFAULT_MAX_DORSAL): GoogleVisionResult {
     const textAnnotations = result.textAnnotations || [];
     const detectedWords: Array<{ text: string; confidence: number; boundingBox?: any }> = [];
     let allText = '';
@@ -393,19 +424,20 @@ export class GoogleVisionOCRProcessor {
     }
     
     // Filter dorsal numbers by size and position to get only the most representative ones
-    const dorsalNumbers = this.extractRepresentativeDorsalNumbers(detectedWords);
-    
+    const dorsalNumbers = this.extractRepresentativeDorsalNumbers(detectedWords, maxDorsal);
+
     console.log(`🎯 Filtrado inteligente: ${dorsalNumbers.length} dorsales representativos de ${detectedWords.length} elementos detectados`);
-    
+
     return {
       dorsalNumbers,
       confidence: detectedWords.length > 0 ? 95 : 0, // Google Vision is generally very accurate
       allText: allText.trim(),
-      detectedWords
+      detectedWords,
+      success: true
     };
   }
 
-  private extractRepresentativeDorsalNumbers(detectedWords: Array<{ text: string; confidence: number; boundingBox?: any }>): number[] {
+  private extractRepresentativeDorsalNumbers(detectedWords: Array<{ text: string; confidence: number; boundingBox?: any }>, maxDorsal: number = DEFAULT_MAX_DORSAL): number[] {
     // Step 1: Find all potential dorsal numbers with their bounding boxes
     const dorsalCandidates: Array<{ 
       number: number; 
@@ -433,7 +465,7 @@ export class GoogleVisionOCRProcessor {
         const centerY = (minY + maxY) / 2;
         
         // Check if this looks like a dorsal number
-        const dorsalMatches = this.extractDorsalNumbersFromText(word.text);
+        const dorsalMatches = this.extractDorsalNumbersFromText(word.text, maxDorsal);
         
         dorsalMatches.forEach(number => {
           dorsalCandidates.push({
@@ -481,18 +513,39 @@ export class GoogleVisionOCRProcessor {
     return sortedDorsals;
   }
   
-  private extractDorsalNumbersFromText(text: string): number[] {
+  /**
+   * Strips digit sequences that are almost certainly NOT a race dorsal even
+   * though they match a plain \d{N} pattern: stopwatch overlays ("01:23:45"),
+   * distance labels ("10K", "21 KM"), and calendar dates ("15/07/2024"). Each
+   * match is blanked out (replaced with spaces of the same length) so word
+   * boundaries and downstream digit-length matching stay unaffected for the
+   * rest of the text.
+   */
+  private stripNonDorsalContext(text: string): string {
+    const blank = (match: string) => ' '.repeat(match.length);
+    return text
+      // Stopwatch / split time overlays: "1:23:45", "01:23", "12:34:56.7"
+      .replace(/\b\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\b/g, blank)
+      // Distance labels: "10K", "21 KM", "5km"
+      .replace(/\b\d{1,3}\s?(?:k|km)\b/gi, blank)
+      // Calendar dates: "15/07/2024", "07-15-24", "2024/07/15"
+      .replace(/\b\d{1,4}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/g, blank);
+  }
+
+  private extractDorsalNumbersFromText(rawText: string, maxDorsal: number = DEFAULT_MAX_DORSAL): number[] {
     const dorsals = new Set<number>();
+    const text = this.stripNonDorsalContext(rawText);
 
     // Hard limits for valid race dorsal numbers.
-    // Races on this platform use dorsal range 1–1600.
+    // Default range is 1–1600, but callers may pass a different upper bound
+    // per event (shared.events.maxDorsalNumber) for events with more participants.
     // Any number outside this range is NOT a real bib number — it is likely
     // a year stamp, timestamp fragment, banner text, or image metadata artefact.
     const MIN_DORSAL = 1;
-    const MAX_DORSAL = 1600;
+    const MAX_DORSAL = maxDorsal;
 
-    // Extract 4-digit numbers that fall in the valid range 1000–1600.
-    // (Numbers 1601–9999 are NOT valid race dorsals for any event on this platform.)
+    // Extract 4-digit numbers that fall in the valid range 1000–MAX_DORSAL.
+    // (Numbers above MAX_DORSAL are NOT valid race dorsals for this event.)
     const fourDigitMatches = text.match(/\b\d{4}\b/g) || [];
     fourDigitMatches.forEach(match => {
       const num = parseInt(match, 10);
@@ -501,20 +554,21 @@ export class GoogleVisionOCRProcessor {
       }
     });
 
-    // Extract 3-digit numbers (100–999) — all within valid range.
+    // Extract 3-digit numbers (100–999), bounded by MAX_DORSAL for events
+    // with fewer than 999 participants.
     const threeDigitMatches = text.match(/\b\d{3}\b/g) || [];
     threeDigitMatches.forEach(match => {
       const num = parseInt(match, 10);
-      if (num >= 100 && num <= 999) {
+      if (num >= 100 && num <= Math.min(999, MAX_DORSAL)) {
         dorsals.add(num);
       }
     });
 
-    // Extract 2-digit numbers (10–99).
+    // Extract 2-digit numbers (10–99), bounded by MAX_DORSAL.
     const twoDigitMatches = text.match(/\b\d{2}\b/g) || [];
     twoDigitMatches.forEach(match => {
       const num = parseInt(match, 10);
-      if (num >= 10 && num <= 99) {
+      if (num >= 10 && num <= Math.min(99, MAX_DORSAL)) {
         dorsals.add(num);
       }
     });
@@ -595,82 +649,6 @@ export class GoogleVisionOCRProcessor {
 // Factory function to create GoogleVisionOCRProcessor with unified credentials
 export function createGoogleVisionProcessor(cloudStorage: CloudPhotoStorage): GoogleVisionOCRProcessor {
   return new GoogleVisionOCRProcessor(cloudStorage);
-}
-
-// Función de comparación entre diferentes métodos OCR
-export async function compareAllOCRMethods(imagePath: string, expectedDorsal: number): Promise<void> {
-  console.log(`\n🔬 COMPARACIÓN COMPLETA DE OCR PARA DORSAL ${expectedDorsal}`);
-  console.log(`📸 Imagen: ${path.basename(imagePath)}`);
-  console.log('━'.repeat(80));
-  
-  const results = {
-    googleVision: { found: false, dorsals: [], confidence: 0, time: 0 },
-    tesseract: { found: false, dorsals: [], confidence: 0, time: 0 }
-  };
-  
-  try {
-    // Test Google Vision
-    console.log('\n1️⃣ GOOGLE VISION OCR:');
-    const googleStart = Date.now();
-    const cloudStorage = (await import('./cloud-storage')).getCloudStorage();
-    const processor = new GoogleVisionOCRProcessor(cloudStorage);
-    const googleResult = await processor.processImage(imagePath);
-    results.googleVision.time = Date.now() - googleStart;
-    results.googleVision.found = googleResult.dorsalNumbers.includes(expectedDorsal);
-    results.googleVision.dorsals = googleResult.dorsalNumbers;
-    results.googleVision.confidence = googleResult.confidence;
-    
-    // Test Tesseract
-    console.log('\n2️⃣ TESSERACT OCR:');
-    const tesseractStart = Date.now();
-    const { processImageWithRealOCR } = await import('./ocr-real');
-    const tesseractResult = await processImageWithRealOCR(imagePath);
-    results.tesseract.time = Date.now() - tesseractStart;
-    results.tesseract.found = tesseractResult.dorsalNumbers.includes(expectedDorsal);
-    results.tesseract.dorsals = tesseractResult.dorsalNumbers as number[];
-    results.tesseract.confidence = tesseractResult.confidence;
-    
-  } catch (error) {
-    console.error('❌ Error en comparación:', error);
-  }
-  
-  // Display comparison results
-  console.log('\n📊 RESULTADOS COMPARATIVOS:');
-  console.log('━'.repeat(80));
-  console.log(`🎯 Dorsal esperado: ${expectedDorsal}`);
-  console.log('');
-  
-  console.log('Google Vision:');
-  console.log(`  ✓ Encontró dorsal: ${results.googleVision.found ? '✅ SÍ' : '❌ NO'}`);
-  console.log(`  📋 Dorsales detectados: [${results.googleVision.dorsals.join(', ') || 'ninguno'}]`);
-  console.log(`  🎯 Confianza: ${results.googleVision.confidence.toFixed(1)}%`);
-  console.log(`  ⏱️ Tiempo: ${results.googleVision.time}ms`);
-  
-  console.log('');
-  console.log('Tesseract:');
-  console.log(`  ✓ Encontró dorsal: ${results.tesseract.found ? '✅ SÍ' : '❌ NO'}`);
-  console.log(`  📋 Dorsales detectados: [${results.tesseract.dorsals.join(', ') || 'ninguno'}]`);
-  console.log(`  🎯 Confianza: ${results.tesseract.confidence.toFixed(1)}%`);
-  console.log(`  ⏱️ Tiempo: ${results.tesseract.time}ms`);
-  
-  // Determine winner
-  console.log('\n🏆 VEREDICTO:');
-  if (results.googleVision.found && !results.tesseract.found) {
-    console.log('🥇 GANADOR: Google Vision OCR es superior para este dorsal');
-  } else if (!results.googleVision.found && results.tesseract.found) {
-    console.log('🥇 GANADOR: Tesseract OCR es superior para este dorsal');
-  } else if (results.googleVision.found && results.tesseract.found) {
-    console.log('🤝 EMPATE: Ambos métodos detectaron el dorsal correctamente');
-    if (results.googleVision.dorsals.length > results.tesseract.dorsals.length) {
-      console.log('📈 Google Vision detectó más dorsales totales');
-    } else if (results.tesseract.dorsals.length > results.googleVision.dorsals.length) {
-      console.log('📈 Tesseract detectó más dorsales totales');
-    }
-  } else {
-    console.log('💔 NINGUNO: Ambos métodos fallaron en detectar el dorsal');
-  }
-  
-  console.log('━'.repeat(80));
 }
 
 // Test function for batch processing

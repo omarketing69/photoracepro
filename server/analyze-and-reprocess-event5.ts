@@ -1,4 +1,5 @@
 import { GoogleVisionOCRProcessor } from './google-vision-ocr';
+import { getCloudStorage } from './cloud-storage';
 import { Storage } from '@google-cloud/storage';
 import path from 'path';
 import fs from 'fs';
@@ -34,7 +35,7 @@ export async function analyzeAndReprocessEvent5() {
     totalPhotos = photoFiles.length;
     console.log(`📊 ${totalPhotos} fotos encontradas para analizar`);
 
-    const googleVisionProcessor = new GoogleVisionOCRProcessor();
+    const googleVisionProcessor = new GoogleVisionOCRProcessor(getCloudStorage());
 
     // FASE 1: Análisis rápido de una muestra
     console.log('\n🔍 FASE 1: Análisis de muestra (20 fotos)');

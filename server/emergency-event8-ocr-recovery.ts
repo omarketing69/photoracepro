@@ -34,7 +34,7 @@ export async function emergencyEvent8OCRRecovery(): Promise<{
   try {
     // Initialize components
     const cloudStorage = getCloudStorage();
-    const ocrProcessor = new GoogleVisionOCRProcessor();
+    const ocrProcessor = new GoogleVisionOCRProcessor(cloudStorage);
     
     // Get all Event 8 photos from database
     console.log(`📊 [EMERGENCY OCR] Getting all Event 8 photos from database...`);
