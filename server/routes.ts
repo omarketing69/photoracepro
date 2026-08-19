@@ -199,6 +199,25 @@ async function processPhotoWithOCR(photoId: number, imagePath: string, eventId: 
   }
 }
 
+// Bifurca la búsqueda por selfie según el motor del evento: AWS Rekognition
+// (real, eventos nuevos) o el matching casero por landmarks (eventos existentes,
+// sin tocar). SelfieFaceError se propaga igual en ambos casos.
+async function performFaceSearch(
+  eventId: number,
+  event: { faceSearchProvider?: string | null },
+  selfieBuffer: Buffer,
+  isRelaxed: boolean
+) {
+  if (event.faceSearchProvider === 'rekognition') {
+    const { searchByFaceAWS } = await import('./aws-rekognition');
+    const result = await searchByFaceAWS(eventId, selfieBuffer, { relaxed: isRelaxed });
+    return { ...result, selfieFacesFound: result.stats.selfieFacesFound };
+  }
+  const { selfieFacesFound, landmarkVector } = await extractSelfieVector(selfieBuffer);
+  const result = await searchByFace(eventId, landmarkVector, { relaxed: isRelaxed });
+  return { ...result, selfieFacesFound };
+}
+
 function generateSimpleToken(): string {
   // Token criptográficamente seguro (no usar Math.random() para tokens).
   return crypto.randomBytes(24).toString('hex');
@@ -443,6 +462,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/events", async (req, res) => {
     try {
       const validatedData = insertEventSchema.parse(req.body);
+      // Todo evento nuevo usa reconocimiento facial real (AWS Rekognition) —
+      // los eventos existentes no se tocan y siguen con el matching casero.
+      validatedData.faceSearchProvider = 'rekognition';
       const event = await storage.createEvent(validatedData);
       
       // Aplicar configuración óptima automática REAL
@@ -498,7 +520,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.log(`🔧 Creating new event from template ${templateEventId}`);
       
       const validatedEventData = insertEventSchema.parse(newEventData);
-      
+      // Todo evento nuevo usa reconocimiento facial real (AWS Rekognition),
+      // independientemente de qué motor usara el evento plantilla.
+      validatedEventData.faceSearchProvider = 'rekognition';
+
       // Crear evento usando plantilla
       const newEvent = await storage.createEventFromTemplate(templateEventId, validatedEventData);
       
@@ -5921,18 +5946,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const isRelaxed = req.query.relaxed === 'true';
 
       try {
-        const { selfieFacesFound, landmarkVector } = await extractSelfieVector(req.file.buffer);
-        console.log(`✅ [FACE-SEARCH] Selfie face detected for event ${eventId} (free). landmark vector length: ${landmarkVector.length}`);
-
-        const result = await searchByFace(eventId, landmarkVector, { relaxed: isRelaxed });
-        console.log(`✅ [FACE-SEARCH] Event ${eventId}: ${result.totalMatches} matches (relaxed: ${isRelaxed}, ${result.stats.photosWithFaceData} photos had face data)`);
+        const result = await performFaceSearch(eventId, event, req.file.buffer, isRelaxed);
+        console.log(`✅ [FACE-SEARCH] Event ${eventId} (free, motor: ${event.faceSearchProvider ?? 'legacy'}): ${result.totalMatches} matches (relaxed: ${isRelaxed}, ${result.stats.photosWithFaceData} photos had face data)`);
 
         res.json({
           matches: result.matches,
           totalMatches: result.totalMatches,
           photosScanned: result.stats.photosScanned,
           photosWithFaceData: result.stats.photosWithFaceData,
-          selfieFacesFound,
+          selfieFacesFound: result.selfieFacesFound,
           isRelaxed,
         });
       } catch (err) {
@@ -5968,18 +5990,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const isRelaxed = req.query.relaxed === 'true';
 
       try {
-        const { selfieFacesFound, landmarkVector } = await extractSelfieVector(req.file.buffer);
-        console.log(`✅ [FACE-SEARCH] Selfie face detected for event ${eventId} (isFreeEvent: ${event.freePhotosEnabled}). landmark vector length: ${landmarkVector.length}`);
-
-        const result = await searchByFace(eventId, landmarkVector, { relaxed: isRelaxed });
-        console.log(`✅ [FACE-SEARCH] Event ${eventId}: ${result.totalMatches} matches (relaxed: ${isRelaxed}, ${result.stats.photosWithFaceData} photos had face data)`);
+        const result = await performFaceSearch(eventId, event, req.file.buffer, isRelaxed);
+        console.log(`✅ [FACE-SEARCH] Event ${eventId} (isFreeEvent: ${event.freePhotosEnabled}, motor: ${event.faceSearchProvider ?? 'legacy'}): ${result.totalMatches} matches (relaxed: ${isRelaxed}, ${result.stats.photosWithFaceData} photos had face data)`);
 
         res.json({
           matches: result.matches,
           totalMatches: result.totalMatches,
           photosScanned: result.stats.photosScanned,
           photosWithFaceData: result.stats.photosWithFaceData,
-          selfieFacesFound,
+          selfieFacesFound: result.selfieFacesFound,
           isFreeEvent: event.freePhotosEnabled,
           isRelaxed,
         });

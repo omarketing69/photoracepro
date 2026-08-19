@@ -5,6 +5,7 @@ import { GoogleVisionOCRProcessor, DEFAULT_MAX_DORSAL } from './google-vision-oc
 import { performanceMonitor } from './performance-monitor';
 import { HeicConverter } from './heic-converter';
 import { derivePhotoProcessingState } from './photo-processing-state';
+import { indexFace } from './aws-rekognition';
 
 export class CloudImageService {
   private cloudStorage = getCloudStorage();
@@ -150,6 +151,15 @@ export class CloudImageService {
         processedAt,
       });
       
+      // 5b. Indexar la cara en AWS Rekognition — solo para eventos nuevos
+      // (faceSearchProvider='rekognition'). Los eventos existentes no se tocan.
+      if (event?.faceSearchProvider === 'rekognition') {
+        const indexResult = await indexFace(eventId, photo.id, photoFile.buffer);
+        if (indexResult.faceIds.length > 0) {
+          await storage.updatePhoto(photo.id, { rekognitionFaceIds: indexResult.faceIds });
+        }
+      }
+
       // 6. Organizar por participante si hay dorsales detectados
       if (detectedDorsals.length > 0) {
         await this.cloudStorage.organizeByParticipant(eventId, originalCloudPath, detectedDorsals);

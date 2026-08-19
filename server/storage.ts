@@ -382,7 +382,8 @@ export class DatabaseStorage implements IStorage {
     const photoData = {
       ...insertPhoto,
       detectedDorsals: (insertPhoto.detectedDorsals ?? []) as number[],
-      faces: (insertPhoto.faces ?? []) as Array<{x: number, y: number, width: number, height: number, confidence: number}>
+      faces: (insertPhoto.faces ?? []) as Array<{x: number, y: number, width: number, height: number, confidence: number}>,
+      rekognitionFaceIds: (insertPhoto.rekognitionFaceIds ?? []) as string[]
     };
     const [photo] = await db.insert(photos).values(photoData).returning();
     return photo;
@@ -394,7 +395,8 @@ export class DatabaseStorage implements IStorage {
       .set({
         ...updates,
         detectedDorsals: updates.detectedDorsals ? [...(updates.detectedDorsals as number[])] : undefined,
-        faces: updates.faces ? [...(updates.faces as Array<{x: number, y: number, width: number, height: number, confidence: number, landmarks?: Array<{type: string, x: number, y: number}>, landmarkVector?: number[], joyLikelihood?: string, sorrowLikelihood?: string, angerLikelihood?: string, surpriseLikelihood?: string}>)] : undefined
+        faces: updates.faces ? [...(updates.faces as Array<{x: number, y: number, width: number, height: number, confidence: number, landmarks?: Array<{type: string, x: number, y: number}>, landmarkVector?: number[], joyLikelihood?: string, sorrowLikelihood?: string, angerLikelihood?: string, surpriseLikelihood?: string}>)] : undefined,
+        rekognitionFaceIds: updates.rekognitionFaceIds ? [...(updates.rekognitionFaceIds as string[])] : undefined
       })
       .where(eq(photos.id, id))
       .returning();
@@ -478,6 +480,7 @@ export class DatabaseStorage implements IStorage {
             faces: [],
             processed: true,
             processingStatus: "completed" as const,
+            rekognitionFaceIds: [],
             uploadedAt: new Date("2024-07-15T10:00:00.000Z"),
             processedAt: new Date("2024-07-15T10:05:00.000Z")
           };

@@ -14,6 +14,9 @@ export const events = pgTable("events", {
   freePhotosEnabledAt: timestamp("free_photos_enabled_at"),
   requiresAthleteLogin: boolean("requires_athlete_login").default(false), // For paid events requiring athlete auth
   maxDorsalNumber: integer("max_dorsal_number").default(1600), // Upper bound for valid bib numbers detected by OCR
+  // 'legacy' = homemade cosine-similarity matching over Google Vision landmarks (existing events, untouched).
+  // 'rekognition' = AWS Rekognition Face Search (new events going forward).
+  faceSearchProvider: text("face_search_provider").default("legacy"),
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
@@ -43,6 +46,9 @@ export const photos = pgTable("photos", {
   }>>().default([]),
   processed: boolean("processed").default(false),
   processingStatus: text("processing_status").default("pending"), // pending, processing, completed, failed
+  // Face IDs returned by AWS Rekognition IndexFaces, for events with faceSearchProvider='rekognition'.
+  // Empty for events still on the legacy landmark-vector matching.
+  rekognitionFaceIds: jsonb("rekognition_face_ids").$type<string[]>().default([]),
   uploadedAt: timestamp("uploaded_at").defaultNow(),
   processedAt: timestamp("processed_at"),
 });
